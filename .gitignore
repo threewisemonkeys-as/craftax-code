@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+.pytest_cache/
+*.py[oc]
+build/
+dist/
+*.egg-info
+
+# The two interpreters, and the reason there are two.
+#
+# `.env-venv/` runs the harness: craftax and jax, plus what run.py and act.py
+# need. It is the interpreter run.py is launched under, so `act` in a workspace
+# inherits it. 776MB, rebuilt by tools/make_env_venv.sh.
+#
+# `.agent-venv/` is what the workspace's `python` shim points at: numpy and
+# Pillow and nothing else, so that `import craftax` from it fails. The world
+# generator, the block table and all 67 achievements by name ship inside the
+# package — handing over the harness's own interpreter would hand over the
+# answer. Rebuilt by tools/make_agent_venv.sh.
+.venv
+.env-venv/
+.agent-venv/
+
+# Secrets — never committed
+.env
+
+# Live workspaces, at the root only
+/runs/
