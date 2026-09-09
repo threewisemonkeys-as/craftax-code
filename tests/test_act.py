@@ -12,6 +12,7 @@ score and so was withheld. Here it is the channel a policy is given, so it is sh
 """
 
 import json
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -169,35 +170,50 @@ def test_budget_ends_the_run(rig):
         run(session, ["noop"])
 
 
-def test_reset_is_an_action_and_is_not_an_event(rig):
-    """`[event]` is what the actuator did unasked. A reset the agent played is not,
-    and it does not count as a death."""
+def test_nothing_playable_ends_a_life(rig):
+    """The game's 43 actions, and no forty-fourth.
+
+    There was one: `reset`, which abandoned a life and began the next in the same
+    world. It cost the first real pilot its run. Because the environment's reward is
+    the diff against the *episode's* achievement vector, every life re-earns
+    everything, so `reset left do` paid +1 every three actions — and the session found
+    it, wrote it down as a decisive finding, and spent 226 resets and 715 lives on it
+    while its union score sat at 18. Craftax has no such action; offering one was an
+    addition to the interface, and this is the test that there is nothing left to
+    find."""
     session, ws, _ = rig()
     run(session, CHOP)
-    run(session, ["reset"])
-    assert session.state.actions_used == 6
-    assert session.state.deaths == 0
-    assert session.state.lives == 2
-    log = (ws / act.LOG).read_text()
-    assert "[event] life over" not in log
-    assert (ws / "frames" / "000006.png").read_bytes() == (
-        ws / "frames" / "000000.png"
-    ).read_bytes()
+    assert session.playable == session.game.tokens
+    assert len(session.playable) == 43
+    with pytest.raises(SystemExit, match="not an action"):
+        run(session, ["reset"])
+    assert session.state.actions_used == 5, "a refused action costs nothing"
+    assert session.state.lives == 1
+    assert "[event] life over" not in (ws / act.LOG).read_text()
 
 
-def test_the_curve_across_lives_is_kept(rig):
-    """Return per life, in order — the thing no RL baseline has an analogue for."""
+def test_the_curve_across_lives_is_kept_and_the_union_is_not_its_sum(rig):
+    """Return per life, in order — the thing no RL baseline has an analogue for — and
+    the property that makes the run total worthless as an objective.
+
+    The same two achievements are earned twice, once in each life, and the union still
+    says two. A session shown the sum across lives would read that as four, which is
+    exactly what the pilot did with 715 of them."""
     session, _, env_dir = rig(budget=600)
     run(session, CHOP)
-    run(session, ["reset"])
-    run(session, ["noop"] * 3)
-    run(session, ["reset"])
-    run(session, CHOP[:3])
+    run(session, ["noop"] * STARVE)  # stops early: this life is over
+    assert session.state.deaths == 1 and session.state.lives == 2
+    first = session.state.life_reward
+    run(session, CHOP)
+
     record = json.loads((env_dir / act.RESULT).read_text())
-    assert len(record["episode_scores"]) == 3, record["episode_scores"]
-    assert record["episode_scores"] == [2, 0, 1], "the same world paid differently"
+    assert record["episode_scores"] == [2, 2], "the same world paid twice"
     assert record["best_episode"] == 2
     assert record["score"] == 2, "the union is not the sum of the lives"
+    assert record["reward"] > 2, "the run total counts the same wood twice"
+    # And the total the session is shown starts again with the life.
+    assert first == 0.0
+    assert session.state.life_reward == pytest.approx(2.0, abs=0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,7 +232,12 @@ def test_state_json_names_neither_the_achievements_nor_the_score(rig):
                  "unique_cells", "max_level", "deaths", "env_dir"):
         assert leak not in on_disk, f"state.json exposes {leak}"
     assert "collect_wood" not in body
-    assert set(on_disk) >= {"budget", "actions_used", "lives", "reward", "terminal"}
+    assert set(on_disk) >= {"budget", "actions_used", "lives", "life_reward",
+                            "terminal"}
+    # The run total is kept for analysis and not shown. It is not a score leak; it is
+    # worse than that, because summed across lives it counts one achievement many
+    # times and a session that optimises it will grind (see `test_nothing_playable...`).
+    assert "reward" not in on_disk
 
 
 def test_the_log_says_nothing_about_the_observation(rig):
@@ -245,11 +266,12 @@ def test_the_preamble_names_the_actions_the_package_names(rig):
     """Nothing is withheld about the vocabulary here — the point is the game as
     shipped, and `make_wood_pickaxe` is what the package calls it."""
     session, ws, _ = rig()
-    assert session.playable == (*session.game.tokens, "reset")
-    assert len(session.playable) == 44
+    assert session.playable == session.game.tokens
+    assert len(session.playable) == 43
     preamble = (ws / act.LOG).read_text().split(act.SEP)[0]
-    for named in ("noop", "left", "do", "make_wood_pickaxe", "cast_fireball", "reset"):
+    for named in ("noop", "left", "do", "make_wood_pickaxe", "cast_fireball"):
         assert named in preamble
+    assert "reset" not in preamble, "the preamble offered an action the game has not"
     assert "226" not in preamble, "the preamble said how much there is to find"
 
 
@@ -259,7 +281,7 @@ def test_the_preamble_names_the_actions_the_package_names(rig):
 
 
 def test_repeat_syntax():
-    playable = ("left", "do", "make_wood_pickaxe", "reset")
+    playable = ("left", "do", "make_wood_pickaxe", "noop")
     assert parse_tokens(["left", "do*3", "make_wood_pickaxe"], playable) == [
         "left", "do", "do", "do", "make_wood_pickaxe"
     ]
@@ -304,6 +326,16 @@ def test_daemon_round_trip(tmp_path):
         # The environment's own directory holds the score, and is not anywhere the
         # workspace can be confused for.
         assert not (ws / act.RESULT).exists()
+
+        # A client that hangs up before its reply. The pilot's session was killed
+        # mid-batch, `sendall` raised BrokenPipeError out of the accept loop, the
+        # daemon exited, `act stop` then failed, and run.py discarded the report of a
+        # 2757-action run because its shutdown was untidy.
+        rude = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        rude.connect(str(ws / act.SOCKET))
+        rude.sendall(json.dumps({"command": "status", "args": {}}).encode() + b"\n")
+        rude.close()
+        assert "budget 3/20" in act_cli(ws, "status"), "a rude client killed the daemon"
     finally:
         subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
 

@@ -52,9 +52,13 @@ def replay(record: dict) -> list[dict]:
     """Play the recorded history again and read the score off the engine each action.
 
     Mirrors ``act.Session.play``'s control flow exactly, which is the whole of the
-    correspondence: a `reset` token restarts the world and does not step it, and a
-    life that ends restarts it too — that restart is the actuator's, so it is not in
-    the history and has to be reproduced here rather than read.
+    correspondence: a life that ends restarts the world, and that restart is the
+    actuator's, so it is not in the history and has to be reproduced here rather than
+    read.
+
+    `reset` is handled for the same reason. It is no longer an action — it was removed
+    after the first pilot ground it — but the runs that recorded it are still runs, and
+    a tool that could not read them would make that pilot's history unreadable.
     """
     from craftax_game import CraftaxGame  # noqa: PLC0415
 
@@ -231,10 +235,17 @@ def session(stream: Path) -> dict:
             for block in message.get("content", []):
                 shape = block.get("type")
                 if shape in ("text", "thinking"):
+                    # Thinking arrives as a signature and no text — 422KB of signature
+                    # and zero characters of thought over the pilot's 119 blocks — so
+                    # what a turn wrote can only be measured from its visible text and
+                    # the commands it issued. In the one session that reported a total,
+                    # thinking was 69% of the output tokens, so this proxy says which
+                    # turns wrote more, not how much any of them wrote.
                     row["chars"] += len(block.get(shape) or "")
                     continue
                 if shape != "tool_use":
                     continue
+                row["chars"] += len(json.dumps(block.get("input", {})))
                 row["calls"] += 1
                 got["tool_calls"] += 1
                 name = block.get("name", "?")
@@ -283,6 +294,8 @@ def session(stream: Path) -> dict:
     # The output side, distributed over the turns by what each of them wrote. An
     # apportionment, like the cost column it feeds, and marked as one wherever it is
     # printed: the total is measured, the split is not.
+    # By what each turn visibly wrote — its text and its commands. Thinking is not in
+    # the stream at all, so a turn that thought hard and typed little is undercounted.
     chars = sum(r["chars"] for r in got["turn_rows"]) or 1
     for row in got["turn_rows"]:
         row["output"] = got["output_total"] * row["chars"] / chars
@@ -375,8 +388,11 @@ def main() -> int:
         best = max(record["episode_scores"], default=0)
         print(
             f"\nscore\n"
-            f"  union       {record['score']:>4}/226  {record['score_pct']:>5.1f}%\n"
+            f"  mean life   {record.get('mean_episode', 0):>4}/226  "
+            f"{record.get('mean_episode_pct', 0):>5.1f}%  "
+            f"over {record.get('episodes_completed', 0)} finished lives\n"
             f"  best life   {best:>4}/226  {record['best_episode_pct']:>5.1f}%\n"
+            f"  union       {record['score']:>4}/226  {record['score_pct']:>5.1f}%\n"
             f"  lives {record['lives']}, deaths {record['deaths']}, "
             f"level {record['max_level']}, cells {record['unique_cells']}\n"
             f"  per life    {record['episode_scores']}\n"

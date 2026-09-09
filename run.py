@@ -118,6 +118,12 @@ class Report(BaseModel):
     # for, since the agent carries notes across deaths where a policy carries weights.
     best_episode: int = 0
     best_episode_pct: float = 0.0
+    # Mean over the lives the world ended. This is the one that sits beside
+    # PPO-RNN@1B's 15.3%, and `episodes_completed` is its n — often 1 or 2, which is
+    # why the matrix is several seeds rather than one long run.
+    episodes_completed: int = 0
+    mean_episode: float = 0.0
+    mean_episode_pct: float = 0.0
     score: int = 0
     score_pct: float = 0.0
     episode_scores: list[int] = []
@@ -388,15 +394,32 @@ async def play(
         finally:
             # The environment is a daemon holding a JAX process; a batch of six would
             # otherwise leave six behind, each with its compiled step function.
+            #
+            # Not allowed to raise. The first real pilot ended with a daemon that had
+            # already died, `act stop` failed, the exception left this block, and the
+            # report — read and written below — was never produced at all. A run that
+            # played 2757 actions reported nothing because its shutdown was untidy.
             report.seconds = time.monotonic() - started
-            await act(ws, "stop")
+            try:
+                await act(ws, "stop")
+            except (RuntimeError, OSError) as exc:
+                print(f"[{label}] the environment did not shut down cleanly: "
+                      f"{' '.join(str(exc).split())[:200]}", flush=True)
 
         if stderr.strip():
             (ws / "agent_stderr.log").write_text(stderr)
         # From the actuator's private record rather than state.json, which
-        # deliberately carries neither the achievements nor the score.
-        record = json.loads((env_dir / RESULT).read_text())
+        # deliberately carries neither the achievements nor the score. Written after
+        # every action, so it exists unless the session never played one.
+        result = env_dir / RESULT
+        if not result.exists():
+            print(f"[{label}] no actions were played — nothing to score", flush=True)
+            report.exit_code = report.exit_code or 1
+            write_report(root, report)
+            return report
+        record = json.loads(result.read_text())
         for field in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                      "episodes_completed", "mean_episode", "mean_episode_pct",
                       "score", "score_pct", "episode_scores", "achievements",
                       "lives", "deaths", "unique_cells", "max_level"):
             setattr(report, field, record[field])
@@ -409,6 +432,7 @@ async def play(
         flag = "" if report.ok else f" EXIT {report.exit_code}"
         print(
             f"[{label}] {report.variant} seed {report.seed}: "
+            f"{report.mean_episode_pct:.1f}% mean of {report.episodes_completed}, "
             f"{report.best_episode_pct:.1f}% best life, {report.score_pct:.1f}% union, "
             f"{report.actions_used}/{report.budget} actions, {report.deaths} deaths, "
             f"{report.turns} turns, ${report.cost_usd:.2f}, "
@@ -470,12 +494,14 @@ def summarise(reports: list[Report], root: Path) -> None:
     if not reports:
         print("\nno world produced a report — every one of them failed to run")
         return
-    print(f"\n{'world':16}  label  best%  union%  actions  lives  deaths  depth   cost   minutes")
+    print(f"\n{'world':16}  label  mean%    n  best%  union%  actions  lives  deaths  "
+          f"depth   cost   minutes")
     for r in sorted(reports, key=lambda r: (r.variant, r.seed)):
         mark = "" if r.audit.clean else "  AUDIT FAILED"
         world = f"{r.variant}:{r.seed}"
         print(
-            f"{world:16}  {r.label}  {r.best_episode_pct:5.1f}  {r.score_pct:6.1f}  "
+            f"{world:16}  {r.label}  {r.mean_episode_pct:5.1f}  "
+            f"{r.episodes_completed:>3}  {r.best_episode_pct:5.1f}  {r.score_pct:6.1f}  "
             f"{r.actions_used:>7}  {r.lives:>5}  {r.deaths:>6}  {r.max_level:>5}  "
             f"${r.cost_usd:>5.2f}  {r.seconds / 60:>7.1f}{mark}"
         )

@@ -57,6 +57,14 @@ SEP = "=" * 80
 # few hundred. 3000 is roughly a dozen lives on Craftax — enough for a curve across
 # them, and not enough to grind the tree. Classic is smaller in every dimension.
 DEFAULT_BUDGET = {"craftax": 3000, "classic": 1500}
+# Not an action. Craftax's action space is 43 actions and none of them abandons a
+# life, so offering one was an addition to the interface rather than a reading of it —
+# and the first real session found what the addition was worth. Because a new life
+# re-earns every achievement (the environment's reward is the diff against the
+# episode's own achievement vector), `reset left do` paid +1 every three actions
+# forever: 715 lives, 226 of them one action long, and a union score that never moved
+# off 18. The name stays here because the runs that recorded it still have to be
+# readable (tools/readout.py replays their histories).
 RESET = "reset"
 # A batch may repeat a token: `left*12`. Locomotion is most of what a run spends,
 # and a 200-action traverse should not cost 200 tokens of command line.
@@ -88,6 +96,12 @@ class RunState(BaseModel):
 
     actions_used: int = 0
     lives: int = 1
+    # Two totals, because they are not the same question. `life_reward` is this life's
+    # return, which is the unit the benchmark reports and the one `status` shows. The
+    # run total is kept for analysis and not shown: summed across lives it counts the
+    # same achievement once per life, and a session shown that number will optimise it
+    # (see RESET).
+    life_reward: float = 0.0
     reward: float = 0.0
     terminal: bool = False
     outcome: str = ""  # "" | "budget"
@@ -108,7 +122,7 @@ class RunState(BaseModel):
 
     PRIVATE: ClassVar[set[str]] = {
         "env_dir", "episodes", "achievements", "score", "max_score",
-        "unique_cells", "max_level", "deaths",
+        "unique_cells", "max_level", "deaths", "reward",
     }
 
     def save(self, ws: Path) -> None:
@@ -126,10 +140,20 @@ class RunState(BaseModel):
         if not self.env_dir:
             return
         best = max((e["score"] for e in self.episodes), default=0)
+        # The benchmark reports mean return per *episode*, and only a life the world
+        # ended is an episode: the last one is usually cut off by the budget, and
+        # averaging a truncated life in with finished ones reports a number the
+        # comparison cannot carry. How many there were is recorded beside the mean,
+        # because on a 3000-action run it is often one or two.
+        done = [e["score"] for e in self.episodes if e["ended"]]
+        mean = sum(done) / len(done) if done else 0.0
         body = self.model_dump() | {
             "episode_scores": [e["score"] for e in self.episodes],
             "best_episode": best,
             "best_episode_pct": round(100 * best / self.max_score, 2) if self.max_score else 0.0,
+            "episodes_completed": len(done),
+            "mean_episode": round(mean, 2),
+            "mean_episode_pct": round(100 * mean / self.max_score, 2) if self.max_score else 0.0,
             "score_pct": round(100 * self.score / self.max_score, 2) if self.max_score else 0.0,
         }
         Path(self.env_dir, RESULT).write_text(json.dumps(body, indent=2))
@@ -173,16 +197,18 @@ def preamble(state: RunState, tokens: tuple[str, ...], channels: dict[str, str])
         f"#   about an observation is written here: what is in it is for you to work\n"
         f"#   out.\n"
         f"#\n"
-        f"# actions:\n{wrap(tokens)}\n{wrap((RESET,))}\n"
+        f"# actions:\n{wrap(tokens)}\n"
         f"#   `./act do left do*4 noop` plays them in order; any token may be\n"
-        f"#   repeated with *N. `{RESET}` abandons this life and begins the next one\n"
-        f"#   in the same world. A batch stops early if the life ends, and the rest\n"
-        f"#   of it is dropped — the state you planned against is gone.\n"
+        f"#   repeated with *N. These are all of them, and none of them ends a life:\n"
+        f"#   a life ends when the world ends it. A batch stops early if that\n"
+        f"#   happens, and the rest of it is dropped — the state you planned\n"
+        f"#   against is gone.\n"
         f"# reward: what the action was worth. It is not only good news: some of it\n"
-        f"#   is the change in your condition since the last action.\n"
+        f"#   is the change in your condition since the last action. `status` totals\n"
+        f"#   it for the life you are in, and a new life starts that total again.\n"
         f"# budget: {state.budget} actions for the whole run, across every life.\n"
-        f"#   Every action counts, {RESET} included. There is one phase and nothing\n"
-        f"#   is held back for later.\n"
+        f"#   Every action counts. There is one phase and nothing is held back for\n"
+        f"#   later.\n"
         f"# [event] lines are things the actuator did that you did not ask for:\n"
         f"#   life over — this life ended and the next one began in the same world.\n"
         f"#     The actions already spent stay spent. That block holds two\n"
@@ -290,13 +316,15 @@ class Session:
 
     @property
     def playable(self) -> tuple[str, ...]:
-        return (*self.game.tokens, RESET)
+        """The game's own actions, and nothing else (see RESET)."""
+        return self.game.tokens
 
     def summary(self) -> str:
         state = self.state
         line = (
             f"budget {state.actions_used}/{state.budget} "
-            f"life {state.lives} reward {state.reward:+g} over {state.terminal}"
+            f"life {state.lives} reward {state.life_reward:+g} this life "
+            f"over {state.terminal}"
         )
         if state.terminal:
             line += f" outcome {state.outcome}"
@@ -339,15 +367,11 @@ class Session:
         Returns a reason the batch should stop, or None.
         """
         state = self.state
-        if token == RESET:
-            self.game.restart()
-            reward, alive = 0.0, True
-            state.lives += 1
-        else:
-            reward, alive = self.game.play(token)
+        reward, alive = self.game.play(token)
 
         state.actions_used += 1
         state.reward += reward
+        state.life_reward += reward
         state.history.append(token)
         self.measure()
 
@@ -367,6 +391,7 @@ class Session:
                 how = self.game.episodes[-1].ended
                 self.game.restart()
                 state.lives += 1
+                state.life_reward = 0.0
                 self.measure()
                 restarted = self.game.observe(self.ws, state.actions_used, tag="-restart")
                 body += [f"[event] life over: {how}\n", self.seen(restarted)]
@@ -484,13 +509,23 @@ def serve(args: argparse.Namespace) -> int:
                 try:
                     payload = json.loads(read_line(conn))
                     command = COMMANDS[payload["command"]]
-                    args = argparse.Namespace(**payload["args"])
-                    reply = {"stdout": command(args, session), "rc": 0}
+                    wanted = argparse.Namespace(**payload["args"])
+                    reply = {"stdout": command(wanted, session), "rc": 0}
                 except SystemExit as exc:
                     reply = {"stdout": f"{exc}\n", "rc": 1}
                 except Exception as exc:  # a bug here must not silently strand the agent
                     reply = {"stdout": f"act: {type(exc).__name__}: {exc}\n", "rc": 1}
-                conn.sendall(json.dumps(reply).encode() + b"\n")
+                try:
+                    conn.sendall(json.dumps(reply).encode() + b"\n")
+                except OSError as exc:
+                    # The client went away before its reply: the agent's shell was
+                    # killed, or a long batch outlived whatever was waiting on it.
+                    # The actions it asked for are already played and recorded, and
+                    # there is nobody left to tell. Losing a reply is not losing the
+                    # run, so the loop carries on — before this, one hung-up client
+                    # took the daemon down with a BrokenPipeError, the launcher's
+                    # shutdown then failed, and the failure discarded the report.
+                    print(f"a client hung up before its reply: {exc}", flush=True)
     finally:
         # Whatever happened, leave no socket behind for the next command to trust.
         server.close()

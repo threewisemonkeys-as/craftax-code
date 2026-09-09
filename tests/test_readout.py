@@ -143,6 +143,27 @@ def assistant(mid: str, blocks: list[dict], usage: dict) -> str:
     })
 
 
+def test_what_a_turn_wrote_is_read_from_text_and_commands(tmp_path):
+    """Thinking reaches the stream as a signature and no text — 119 blocks of it in the
+    pilot, 422KB of signature, zero characters of thought. So the only measurable
+    output is the visible text and the commands, and a turn's share of the total is
+    taken from those."""
+    stream = tmp_path / "agent_stream.jsonl"
+    stream.write_text("\n".join([
+        assistant("m1", [
+            {"type": "thinking", "thinking": "", "signature": "s" * 3552},
+            {"type": "text", "text": "y" * 20},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "./act do left"}},
+        ], {"cache_read_input_tokens": 10}),
+        json.dumps({"type": "result", "usage": {"output_tokens": 900}}),
+    ]))
+    got = session(stream)
+    row = got["turn_rows"][0]
+    assert row["chars"] > 20, "the command it issued is output it wrote"
+    assert row["chars"] < 200, "the signature is not output it wrote"
+    assert row["output"] == 900
+
+
 def test_one_response_is_one_turn_however_many_events_it_arrives_as(tmp_path):
     """Three events, one `message.id`, one request's worth of tokens. Summing the
     events would report three turns and triple the context they were charged for."""

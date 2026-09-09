@@ -52,7 +52,12 @@ simulator you can re-run all beat re-deriving them.
 - The reward is evidence and it is cheap to get wrong. A number arriving does not say
   which of the things you just did earned it, and some of what it reports is only your
   own condition changing. When a reward surprises you, the way to find out what caused
-  it is to do the shortest thing that would produce it again.
+  it is to do the shortest thing that would produce it again. That is a diagnosis and
+  not a plan: once you know what paid, the question is what it is *for*, and a cheap
+  thing you can repeat a hundred times is the least likely answer. If the shortest
+  thing that pays is also the first thing you tried, suspect you have found a property
+  of the machinery you are being measured through rather than of the world you are
+  being measured on. Spend the batch on the world.
 - Break what you can see into distinct kinds of thing — position, appearance,
   behaviour, what happens when you act on them — and give each a role: you, the ground,
   what blocks you, what hurts you, what is worth something.
@@ -70,7 +75,9 @@ simulator you can re-run all beat re-deriving them.
   is the state you died in, and it is the only place that state is ever shown — read it
   before you move on. The world you wake up in is the same one, so everything you
   worked out about it still holds, and the same actions from the beginning do the same
-  things. What you lost is what you were carrying and where you stood.
+  things. What you lost is what you were carrying and where you stood — which is most
+  of what a life is worth, so it is a real loss and worth avoiding. Nothing you can
+  play ends a life; if one ends, the world ended it.
 - Shell and Python loops around `./act` are encouraged — branch on a parsed
   observation, repeat until something changes, search for a position. You are not
   limited to fixed action lists.

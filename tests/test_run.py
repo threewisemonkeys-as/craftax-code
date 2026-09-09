@@ -49,6 +49,19 @@ def test_the_brief_explains_no_mechanic(tmp_path):
         assert not re.search(rf"\b{word}\b", brief), f"the brief says {word!r}"
 
 
+def test_the_brief_says_what_the_run_is_judged_on(tmp_path):
+    """The first pilot was told what it could do and not what any of it was for, so it
+    maximised the only number that grew: reward summed over the run, which counts one
+    achievement once per life. Naming the unit the benchmark itself reports — return
+    on a single episode — gives away nothing about the world."""
+    brief = (run.make_workspace(tmp_path, "B4XPT", ["pixels"]) / "CLAUDE.md").read_text()
+    # Wrapped prose: the sentence is there but the line breaks are not where a naive
+    # substring search would put them.
+    said = " ".join(brief.split())
+    assert "judged on is the best single life in it" in said
+    assert "a total across lives is not the thing to grow" in said
+
+
 def test_the_agents_interpreter_reads_observations_and_not_the_package(tmp_path):
     """The run is unplayable without numpy and Pillow, and compromised with craftax."""
     ws = run.make_workspace(tmp_path, "B4XPT", ["pixels"])
