@@ -1,0 +1,265 @@
+/* ── tokens ─────────────────────────────────────────────────────────────────
+   Light is the bare :root. Dark is redefined twice — once for the un-stamped
+   document under prefers-color-scheme, once for an explicit toggle — so all
+   three viewer states resolve. No component colour is declared anywhere but
+   here.                                                                     */
+:root {
+  color-scheme: light;
+  --bg:        #f7f8f9;
+  --panel:     #ffffff;
+  --sunk:      #eef1f4;
+  --line:      #dfe4e9;
+  --line-soft: #ecf0f3;
+  --ink:       #0f1317;
+  --ink-2:     #4c5866;
+  --ink-3:     #78838f;
+
+  --act:       #2a78d6;   /* categorical slot 1 — playing the game        */
+  --off:       #eb6834;   /* categorical slot 2 — work off the board      */
+  --act-soft:  #2a78d61f;
+  --off-soft:  #eb68341f;
+
+  --good:      #0ca30c;
+  --warning:   #fab219;
+  --critical:  #d03b3b;
+
+  --stage:     #0d0f12;
+  --focus:     #2a78d6;
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --serif: "Instrument Serif", ui-serif, Georgia, serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg:        #0f1215;
+    --panel:     #171b20;
+    --sunk:      #1e242a;
+    --line:      #2a313a;
+    --line-soft: #222831;
+    --ink:       #eef1f4;
+    --ink-2:     #a9b4bf;
+    --ink-3:     #7c8894;
+    --act:       #3987e5;
+    --off:       #d95926;
+    --act-soft:  #3987e526;
+    --off-soft:  #d9592626;
+    --stage:     #0a0c0e;
+    --focus:     #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:        #0f1215;
+  --panel:     #171b20;
+  --sunk:      #1e242a;
+  --line:      #2a313a;
+  --line-soft: #222831;
+  --ink:       #eef1f4;
+  --ink-2:     #a9b4bf;
+  --ink-3:     #7c8894;
+  --act:       #3987e5;
+  --off:       #d95926;
+  --act-soft:  #3987e526;
+  --off-soft:  #d9592626;
+  --stage:     #0a0c0e;
+  --focus:     #3987e5;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { margin: 0; font-weight: 400; text-wrap: balance; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
+.num { font-variant-numeric: tabular-nums; }
+
+.wrap { max-width: 1460px; margin: 0 auto; padding: 28px 22px 64px; }
+
+/* ── masthead ───────────────────────────────────────────────────────────── */
+.mast { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 18px 28px; margin-bottom: 22px; }
+.mast h1 { font-family: var(--serif); font-size: clamp(30px, 4.2vw, 46px); line-height: 1.02; letter-spacing: -0.01em; }
+.mast p { margin: 0; max-width: 62ch; color: var(--ink-2); font-size: 14px; }
+
+/* ── game picker ────────────────────────────────────────────────────────── */
+.picker { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; overflow-x: auto; margin-bottom: 20px; }
+table.matrix { border-collapse: collapse; width: 100%; min-width: 900px; }
+table.matrix th {
+  font-weight: 500; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-3); padding: 11px 12px; text-align: right; border-bottom: 1px solid var(--line);
+}
+table.matrix th:first-child, table.matrix th:nth-child(2) { text-align: left; }
+table.matrix td { padding: 0; border-bottom: 1px solid var(--line-soft); }
+table.matrix tr:last-child td { border-bottom: 0; }
+.row-btn {
+  display: contents;
+}
+tr.game-row { cursor: pointer; }
+tr.game-row:hover td { background: var(--sunk); }
+tr.game-row[aria-current="true"] td { background: var(--act-soft); box-shadow: inset 0 1px 0 var(--focus), inset 0 -1px 0 var(--focus); }
+tr.game-row td { padding: 9px 12px; text-align: right; font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+tr.game-row td.name { text-align: left; font-family: var(--sans); font-size: 14px; font-weight: 600; color: var(--ink); white-space: nowrap; }
+tr.game-row td.what { text-align: left; font-family: var(--sans); font-size: 12.5px; color: var(--ink-3); max-width: 40ch; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 7px; vertical-align: 1px; }
+.dot.good { background: var(--good); }
+.dot.warning { background: var(--warning); }
+.dot.critical { background: var(--critical); }
+.dot.zero { background: var(--ink-3); }
+
+/* ── working area ───────────────────────────────────────────────────────── */
+.work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 0.92fr); gap: 18px; align-items: start; }
+@media (max-width: 1100px) { .work { grid-template-columns: 1fr; } }
+
+.card { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; }
+.card > header {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 11px 14px; border-bottom: 1px solid var(--line-soft);
+}
+.card > header h2 { font-family: var(--serif); font-size: 19px; }
+.card > header .hint { font-size: 11.5px; color: var(--ink-3); margin-left: auto; font-family: var(--mono); }
+.card > header .hint + button.tb.small { margin-left: 10px; }
+.card .body { padding: 14px; }
+
+/* ── the stage ──────────────────────────────────────────────────────────── */
+.stage-wrap { background: var(--stage); border-radius: 8px; padding: 14px; display: flex; justify-content: center; }
+.stage-inner { position: relative; width: 100%; max-width: 396px; aspect-ratio: 11 / 13; }
+#stage { position: absolute; inset: 0; width: 100%; height: 100%;
+         image-rendering: pixelated; image-rendering: crisp-edges; background: var(--stage); }
+/* The map is the top 9 of the 13 tile rows; the rest is the HUD the game draws
+   for a human. The line says where one ends and the other begins. */
+.seam { position: absolute; left: 0; right: 0; top: calc(9 / 13 * 100%);
+        border-top: 1px dashed #ffffff30; pointer-events: none; }
+.stale { position: absolute; right: 8px; top: 8px; font: 500 10px var(--mono);
+         background: #000000a8; color: #fff; padding: 2px 7px; border-radius: 5px; }
+#overlay { pointer-events: none; }
+
+.legend-row { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 12px; font-size: 11px; color: var(--ink-3); font-family: var(--mono); align-items: center; }
+.legend-row label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.legend-row i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.legend-row i.chg { box-shadow: inset 0 0 0 1.5px var(--off); }
+.legend-row i.eye { background: var(--warning); }
+.legend-row i.load { background: var(--off); opacity: .55; }
+.frame-line { margin-top: 6px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.legend-row i.eye.crop { opacity: .5; }
+.legend-row i.death { background: var(--critical); }
+.legend-row i.fired { background: var(--good); }
+.legend-row i.deep { background: #8b5cf6; }
+
+/* ── transport ─────────────────────────────────────────────────────────────
+   Five lanes down a 76px track, because a 3000-action run has more to say than a
+   400-action one: work done before a batch hangs above the bar, the bar itself is
+   the batches, marks that matter straddle it, frames read by eye sit under it, and
+   the score runs along the bottom.                                          */
+.transport { margin-top: 16px; }
+.track { position: relative; height: 76px; margin-bottom: 8px; }
+.bed { position: absolute; top: 22px; left: 0; right: 0; height: 12px; border-radius: 2px; background: var(--line); }
+.seg { position: absolute; top: 22px; height: 12px; border-radius: 2px; background: var(--act); opacity: .42; }
+.seg:nth-of-type(even) { opacity: .68; }
+/* Work done before a batch, hanging above the batch it paid for. */
+.track .load { position: absolute; bottom: 54px; background: var(--off); opacity: .55; border-radius: 1px 1px 0 0; }
+.mark { position: absolute; width: 2px; }
+.mark.fired { top: 18px; height: 20px; background: var(--good); }
+.mark.deep { top: 18px; height: 20px; background: #8b5cf6; }
+.mark.death { top: 18px; height: 20px; background: var(--critical); }
+.mark.eye { top: 38px; height: 7px; background: var(--warning); }
+.mark.eye.crop { top: 40px; height: 4px; background: var(--warning); opacity: .5; }
+/* The score as it stood. Most of a long run is flat; the question is where it is not. */
+.curve { position: absolute; left: 0; right: 0; bottom: 0; height: 26px; width: 100%; }
+.head { position: absolute; top: 4px; width: 2px; height: 64px; background: var(--ink); border-radius: 1px; pointer-events: none; }
+.head::after { content: ""; position: absolute; top: -3px; left: -3px; width: 8px; height: 8px; border-radius: 50%; background: var(--ink); }
+input[type="range"] { position: absolute; inset: 0; width: 100%; height: 76px; margin: 0; opacity: 0; cursor: pointer; }
+
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+button.tb {
+  font: 500 13px var(--sans); padding: 6px 11px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
+}
+button.tb:hover { background: var(--sunk); border-color: var(--ink-3); }
+button.tb.small { font-size: 11px; padding: 3px 8px; }
+.counter { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); margin-left: auto; }
+.keys { font-family: var(--mono); font-size: 11px; color: var(--ink-3); width: 100%; }
+kbd { font: 500 10.5px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--ink-2); }
+
+/* ── right rail ─────────────────────────────────────────────────────────── */
+.rail { display: flex; flex-direction: column; gap: 14px; }
+.now-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.played { font-family: var(--mono); font-size: 25px; font-weight: 600; letter-spacing: -0.01em; }
+.chip {
+  font: 500 11px var(--sans); letter-spacing: .06em; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); white-space: nowrap;
+}
+.chip.act { border-color: var(--act); color: var(--act); background: var(--act-soft); }
+.chip.good { border-color: var(--good); color: var(--good); }
+.chip.critical { border-color: var(--critical); color: var(--critical); }
+.chip.warning { border-color: var(--warning); color: var(--warning); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); gap: 10px; margin: 12px 0 0; }
+.fact { background: var(--sunk); border-radius: 7px; padding: 8px 10px; }
+.fact dt { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
+.fact dd { margin: 2px 0 0; font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums; }
+
+.plan { font-size: 14px; line-height: 1.5; }
+.plan.none { color: var(--ink-3); font-style: italic; }
+.tok { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 10px; }
+.tok b { font: 500 11px var(--mono); padding: 2px 6px; border-radius: 4px; background: var(--sunk); color: var(--ink-2); }
+.tok b.at { background: var(--act); color: #fff; }
+.tok b.done { opacity: .5; }
+
+pre.code {
+  margin: 8px 0 0; padding: 9px 11px; background: var(--sunk); border-radius: 7px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5; overflow-x: auto;
+  white-space: pre-wrap; word-break: break-word; color: var(--ink-2); max-height: 260px;
+}
+pre.code.out { color: var(--ink); background: transparent; border: 1px solid var(--line-soft); }
+pre.code.err { border-color: var(--critical); }
+
+/* ── work off the board ─────────────────────────────────────────────────── */
+#offboard { max-height: 620px; overflow-y: auto; }
+.evt { border-top: 1px solid var(--line-soft); padding: 10px 0; }
+.evt:first-child { border-top: 0; padding-top: 0; }
+.evt .top { display: flex; align-items: center; gap: 8px; }
+.evt .tag { font: 600 9.5px var(--sans); letter-spacing: .09em; text-transform: uppercase; padding: 1px 6px; border-radius: 4px; background: var(--sunk); color: var(--ink-3); flex: none; }
+.evt .tag.Bash { background: var(--act-soft); color: var(--act); }
+.evt .tag.Write, .evt .tag.Edit { background: var(--off-soft); color: var(--off); }
+.evt .tag.Read { background: #fab2192b; color: var(--warning); }
+.evt .name { font-family: var(--mono); font-size: 12px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.evt .said { font-size: 13.5px; color: var(--ink-2); }
+.evt .why { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+.evt button.more { margin-left: auto; font: 500 11px var(--sans); background: none; border: 0; color: var(--act); cursor: pointer; padding: 2px 4px; flex: none; }
+.evt .eyed { font: 500 11px var(--mono); color: var(--warning); margin-top: 4px; }
+.free { font-size: 11.5px; color: var(--ink-3); margin: 0 0 10px; }
+.empty { color: var(--ink-3); font-size: 13px; font-style: italic; }
+.sealed { font-size: 12px; color: var(--ink-3); font-style: italic; border-left: 2px solid var(--line); padding-left: 9px; }
+
+.note { font-size: 12.5px; color: var(--ink-3); margin-top: 14px; line-height: 1.6; }
+.note b { color: var(--ink-2); font-weight: 500; }
+.footer { margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink-3); max-width: 82ch; line-height: 1.65; }
+.footer p { margin: 0 0 9px; }
+.footer b { color: var(--ink-2); font-weight: 500; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── condition ──────────────────────────────────────────────────────────── */
+.meters { display: grid; gap: 6px; margin-top: 12px; }
+.meter { display: grid; grid-template-columns: 52px 1fr 26px; align-items: center; gap: 8px; }
+.meter span { font: 500 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+.meter .bar { height: 7px; border-radius: 4px; background: var(--sunk); overflow: hidden; }
+.meter .bar i { display: block; height: 100%; border-radius: 4px; background: var(--act); }
+.meter.low .bar i { background: var(--critical); }
+.meter b { font: 500 11.5px var(--mono); font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+
+/* ── achievements ───────────────────────────────────────────────────────── */
+.ach { display: flex; flex-wrap: wrap; gap: 4px; }
+.ach b { font: 500 10.5px var(--mono); padding: 2px 6px; border-radius: 4px;
+         background: var(--sunk); color: var(--ink-3); }
+.ach b.got { background: #0ca30c1f; color: var(--good); }
+.ach b.now { background: var(--good); color: #fff; }
+.tier { font: 500 10px var(--mono); letter-spacing: .06em; text-transform: uppercase;
+        color: var(--ink-3); margin: 10px 0 4px; }
+.tier:first-child { margin-top: 0; }

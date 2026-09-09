@@ -1,0 +1,570 @@
+<meta charset="utf-8">
+<title>Craftax, Played From Pixels</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap">
+
+<style>/*__CSS__*/</style>
+
+<div class="wrap">
+  <div class="mast">
+    <div><h1>Craftax, played from pixels</h1></div>
+    <p>A coding agent playing Matthews et al.'s Craftax as it ships — real action
+       names, real reward, lives that end when the world ends them. Pick a run, then
+       scrub it: beside each frame is the plan that batch was given, the actions in
+       it, and the work the session did in its workspace before playing them.</p>
+  </div>
+
+  <div class="picker"><table class="matrix" id="matrix"></table></div>
+
+  <div class="work">
+    <div>
+      <div class="card">
+        <header>
+          <h2 id="stage-title"></h2>
+          <span class="hint" id="stage-hint"></span>
+        </header>
+        <div class="body">
+          <div class="stage-wrap">
+            <div class="stage-inner">
+              <img id="stage" alt="The frame this action produced">
+              <div class="seam"></div>
+              <div class="stale" id="stale" hidden></div>
+            </div>
+          </div>
+          <div class="legend-row">
+            <span><i class="fired"></i> achievement</span>
+            <span><i class="deep"></i> changed level</span>
+            <span><i class="death"></i> life ended</span>
+            <span><i class="eye"></i> looked at <i class="eye crop"></i> crop of it</span>
+            <span><i class="load"></i> work before it</span>
+          </div>
+          <div class="frame-line" id="frame-name"></div>
+          <div class="transport">
+            <div class="track" id="track">
+              <div class="bed"></div>
+              <canvas class="curve" id="curve"></canvas>
+              <div class="head" id="head"></div>
+              <input type="range" id="slider" min="0" value="0" aria-label="Frame index">
+            </div>
+            <div class="controls">
+              <button class="tb" id="prev-batch" title="Previous batch (Shift + Left)">⇤ batch</button>
+              <button class="tb" id="prev">← step</button>
+              <button class="tb" id="play">▶ play</button>
+              <button class="tb" id="next">step →</button>
+              <button class="tb" id="next-batch" title="Next batch (Shift + Right)">batch ⇥</button>
+              <button class="tb" id="next-event" title="Next achievement, descent or death (Shift + Down)">next event ↓</button>
+              <span class="counter num" id="counter"></span>
+              <span class="keys">
+                <kbd>←</kbd> <kbd>→</kbd> step · <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> batch ·
+                <kbd>shift</kbd>+<kbd>↓</kbd> next event · <kbd>space</kbd> play ·
+                <kbd>home</kbd> <kbd>end</kbd> jump
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:18px">
+        <header>
+          <h2>Off the board</h2>
+          <span class="hint" id="off-hint">costs no budget</span>
+          <button class="tb small" id="expand-all">show all</button>
+        </header>
+        <div class="body" id="offboard"></div>
+      </div>
+    </div>
+
+    <div class="rail">
+      <div class="card">
+        <header><h2>Now</h2><span class="hint" id="now-hint"></span></header>
+        <div class="body">
+          <div class="now-line">
+            <span class="played num" id="played"></span>
+            <span class="chip act" id="phase-chip"></span>
+          </div>
+          <dl class="facts" id="facts"></dl>
+          <div class="meters" id="meters"></div>
+        </div>
+      </div>
+      <div class="card">
+        <header><h2>Intent</h2><span class="hint" id="intent-hint"></span></header>
+        <div class="body" id="intent"></div>
+      </div>
+      <div class="card">
+        <header><h2>Unlocked</h2><span class="hint" id="ach-hint"></span></header>
+        <div class="body" id="ach"></div>
+      </div>
+      <div class="card">
+        <header><h2>What it wrote down</h2><span class="hint">notes.md, at the end</span></header>
+        <div class="body" id="notes"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer" id="footer"></div>
+</div>
+
+<script type="application/json" id="bundle">/*__DATA__*/</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("bundle").textContent);
+const el = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const pad = (n) => String(n).padStart(6, "0");
+
+/* ── state ──────────────────────────────────────────────────────────────── */
+let game = null;      /* the run being shown  */
+let idx = 0;          /* index into game.frames */
+let timer = null;
+let shown = null;     /* Set of frame indices that have a picture */
+
+/* ── the picker ─────────────────────────────────────────────────────────── */
+const COLS = [
+  ["mean%", (g) => (g.record.mean_episode_pct ?? 0).toFixed(1)],
+  ["n", (g) => g.record.episodes_completed ?? 0],
+  ["best%", (g) => (g.record.best_episode_pct ?? 0).toFixed(1)],
+  ["union%", (g) => (g.record.score_pct ?? 0).toFixed(1)],
+  ["actions", (g) => g.record.actions_used],
+  ["lives", (g) => g.record.lives],
+  ["deaths", (g) => g.record.deaths],
+  ["depth", (g) => g.record.max_level],
+  ["turns", (g) => g.report.turns ?? "—"],
+  ["cost", (g) => g.report.cost_usd != null ? "$" + g.report.cost_usd.toFixed(2) : "—"],
+];
+
+function buildMatrix() {
+  const t = el("matrix");
+  t.innerHTML = "<tr><th>Run</th><th>What it reached</th>" +
+    COLS.map(([h]) => `<th>${h}</th>`).join("") + "</tr>";
+  for (const g of DATA.runs) {
+    const audit = g.report.audit || { findings: {} };
+    const dirty = Object.keys(audit.findings || {}).length > 0;
+    const row = document.createElement("tr");
+    row.className = "game-row";
+    row.dataset.label = g.label;
+    row.tabIndex = 0;
+    const deepest = g.record.max_level > 0 ? `reached level ${g.record.max_level}` : "never left the surface";
+    row.innerHTML =
+      `<td class="name"><span class="dot ${dirty ? "critical" : "good"}"></span>` +
+      `${esc(g.variant)}:${esc(g.seed)}</td>` +
+      `<td class="what">${esc(plural((g.record.achievements || []).length, "achievement"))}, ${esc(deepest)}</td>` +
+      COLS.map(([, f]) => `<td>${esc(f(g))}</td>`).join("");
+    row.title = `workspace ${g.label}` + (dirty ? " · AUDIT FLAGGED" : " · audit clean");
+    const go = () => load(g.label);
+    row.addEventListener("click", go);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+    });
+    t.appendChild(row);
+  }
+}
+
+/* ── frames ─────────────────────────────────────────────────────────────────
+   A step scrolls the whole view, so there are no deltas worth taking: each frame
+   is its own picture. In directory mode they sit beside the page and the browser
+   fetches them as the cursor arrives; inlined, they are already here. Either way
+   an action without a picture of its own shows the last one there was, said so on
+   the frame rather than left to look like a stall.                          */
+function src(i) {
+  if (game.dir) return `${game.dir}/${pad(game.frames[i].n)}` +
+    (game.frames[i].kind === "restart" ? "-restart" : "") + ".webp";
+  return "data:image/webp;base64," + game.img[String(i)];
+}
+
+function nearest(i) {
+  if (shown.has(i)) return i;
+  for (let d = 1; d < game.frames.length; d++) {
+    if (i - d >= 0 && shown.has(i - d)) return i - d;
+    if (i + d < game.frames.length && shown.has(i + d)) return i + d;
+  }
+  return 0;
+}
+
+/* The next few frames, so scrubbing and playback do not flicker. Directory mode
+   only: inlined frames are already in the document. */
+function prefetch(i) {
+  if (!game.dir) return;
+  for (let k = 1; k <= 6; k++) {
+    const j = i + k;
+    if (j < game.frames.length && shown.has(j)) new Image().src = src(j);
+  }
+}
+
+/* ── the track ──────────────────────────────────────────────────────────── */
+/* The sparse facts about a run, walked once when it loads rather than on every
+   step. A 3000-frame trajectory holds 27 achievements and 416 batches, and
+   rescanning it to render one panel is the difference between scrubbing and
+   stuttering. */
+function index() {
+  game._fired = [];
+  game._first = new Map();
+  game._count = new Map();
+  game.frames.forEach((f, i) => {
+    for (const a of (f.fired || "").split(" ").filter(Boolean)) game._fired.push([i, a]);
+    if (!game._first.has(f.b)) game._first.set(f.b, i);
+    game._count.set(f.b, (game._count.get(f.b) || 0) + 1);
+  });
+}
+
+function buildTrack() {
+  const track = el("track"), n = game.frames.length;
+  [...track.querySelectorAll(".seg, .mark")].forEach((e) => e.remove());
+  const pct = (i) => (100 * i) / n;
+  /* How much work went into each batch before it was played, to one scale across
+     the run: the action counts are bunched and the effort behind them is not. */
+  const busiest = Math.max(1, ...game.batches.map(calls));
+  game.batches.forEach((b, bi) => {
+    if (!game._first.has(bi)) return;
+    const at = game._first.get(bi);
+    const width = Math.max(0.08, pct(game._count.get(bi) || 1));
+    const seg = document.createElement("div");
+    seg.className = "seg";
+    seg.style.left = pct(at) + "%";
+    seg.style.width = width + "%";
+    seg.title = `batch ${bi + 1} · ${plural(b.played, "action")} · ` +
+      `${plural(calls(b), "call")} off the board` + (b.plan ? `\n${b.plan}` : "");
+    track.appendChild(seg);
+    if (calls(b)) {
+      const load = document.createElement("div");
+      load.className = "load";
+      load.style.left = pct(at) + "%";
+      load.style.width = width + "%";
+      load.style.height = Math.max(1.5, (12 * calls(b)) / busiest) + "px";
+      load.title = seg.title;
+      track.appendChild(load);
+    }
+  });
+  game.frames.forEach((f, i) => {
+    const ended = f.events.some((e) => /life over|run over/.test(e));
+    for (const [cls, on, why] of [
+      ["fired", !!f.fired, f.fired],
+      ["deep", !!f.dlevel, "level " + f.level],
+      ["death", ended, f.events.join(" · ")],
+      ["eye", !!game.looked[f.name], f.name + " — read into context"],
+      ["eye crop", !game.looked[f.name] && !!game.derived[f.name],
+        f.name + " — a crop of it was read"],
+    ]) {
+      if (!on) continue;
+      const m = document.createElement("div");
+      m.className = "mark " + cls;
+      m.style.left = pct(i + 0.5) + "%";
+      m.title = `action ${f.n} — ${why}`;
+      track.appendChild(m);
+    }
+  });
+  el("slider").max = String(n - 1);
+  drawCurve();
+}
+
+/* The score as it stood, under the track. Most of a long run is flat, and the
+   whole question is where it is not. */
+function drawCurve() {
+  const c = el("curve"), n = game.frames.length;
+  if (!DATA.replayed || !n) { c.hidden = true; return; }
+  c.hidden = false;
+  const dpr = window.devicePixelRatio || 1;
+  c.width = Math.max(1, c.clientWidth * dpr);
+  c.height = 26 * dpr;
+  const g = c.getContext("2d");
+  const top = Math.max(1, ...game.frames.map((f) => f.score));
+  g.clearRect(0, 0, c.width, c.height);
+  g.beginPath();
+  g.moveTo(0, c.height);
+  game.frames.forEach((f, i) => {
+    g.lineTo((i / (n - 1)) * c.width, c.height - (f.score / top) * (c.height - 2));
+  });
+  g.lineTo(c.width, c.height);
+  g.closePath();
+  const ink = getComputedStyle(document.body).getPropertyValue("--good").trim() || "#0ca30c";
+  g.fillStyle = ink + "33";
+  g.fill();
+  g.strokeStyle = ink;
+  g.lineWidth = 1 * dpr;
+  g.stroke();
+}
+
+/* ── panels ─────────────────────────────────────────────────────────────── */
+const fact = (label, value) =>
+  `<div class="fact"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`;
+
+function renderNow(f) {
+  el("played").textContent = f.kind === "start" ? "start" : "action " + f.n;
+  const chip = el("phase-chip");
+  const over = f.events.find((e) => e.startsWith("run over"));
+  const died = f.events.find((e) => e.startsWith("life over"));
+  chip.className = "chip " + (over ? "warning" : died ? "critical"
+    : f.kind === "restart" ? "critical" : "act");
+  chip.textContent = over ? over.replace("run over: ", "")
+    : died ? died.replace("life over: ", "died: ")
+    : f.kind === "restart" ? "began again"
+    : f.kind === "start" ? "before anything" : "playing";
+  el("facts").innerHTML =
+    fact("budget", `${f.used}/${game.record.budget}`) +
+    fact("played", f.kind === "restart" ? "auto-restart" : f.tok) +
+    fact("in batch", f.k ? `${f.i}/${f.k}` : "—") +
+    fact("reward", f.reward ? (f.reward > 0 ? "+" : "") + f.reward : "0") +
+    (DATA.replayed ? fact("score", `${f.score}/${game.record.max_score}`) : "") +
+    (DATA.replayed ? fact("life", f.life) : "") +
+    (DATA.replayed ? fact("level", f.level) : "");
+  el("meters").innerHTML = !DATA.replayed ? "" :
+    [["health", f.hp, 9], ["food", f.food, 9], ["drink", f.drink, 9],
+     ["energy", f.energy, 9]]
+      .map(([name, v, max]) =>
+        `<div class="meter${v <= 2 ? " low" : ""}"><span>${name}</span>
+          <div class="bar"><i style="width:${Math.max(0, Math.min(100, 100 * v / max))}%"></i></div>
+          <b>${esc(v)}</b></div>`).join("");
+  el("now-hint").textContent = `${game.label} · ${game.variant} seed ${game.seed}`;
+  const eyed = game.looked[f.name] ? "read into context"
+    : game.derived[f.name] ? "a crop of it was read into context" : "";
+  el("frame-name").textContent = f.name + (eyed ? "  ·  " + eyed : "") +
+    (f.fired ? "  ·  unlocked " + f.fired : "");
+}
+
+function renderIntent(f) {
+  const b = game.batches[f.b];
+  const box = el("intent");
+  if (!b) {
+    box.innerHTML = `<p class="plan none">The state before anything was played.</p>`;
+    el("intent-hint").textContent = "";
+    return;
+  }
+  el("intent-hint").textContent =
+    `batch ${f.b + 1}/${game.batches.length}` +
+    (b.asked && b.played < b.asked ? ` · ${b.asked - b.played} dropped` : "");
+  /* The tokens as played, from the log — the command says `left*12`, and a batch
+     that ends a life never plays the rest of itself. The one being shown is
+     marked, and everything before it is spent. */
+  const here = f.n - b.from;
+  box.innerHTML =
+    (b.plan ? `<p class="plan">${esc(b.plan)}</p>`
+            : `<p class="plan none">No plan was stated for this batch.</p>`) +
+    (b.toks.length ? `<div class="tok">` + b.toks.map((t, i) =>
+      `<b class="${i + 1 === here ? "at" : i + 1 < here ? "done" : ""}">${esc(t)}</b>`
+    ).join("") + `</div>` : "") +
+    (b.cmd ? `<pre class="code">${esc(b.cmd)}</pre>` : "") +
+    (b.out ? `<pre class="code out">${esc(b.out)}</pre>` : "");
+}
+
+function renderAch(f) {
+  const box = el("ach");
+  if (!DATA.replayed) {
+    box.innerHTML = `<p class="empty">Run without --no-replay to see when each
+      achievement fired.</p>`;
+    el("ach-hint").textContent = "";
+    return;
+  }
+  /* Which had fired by here. The run's full set is the backdrop, so what is still
+     missing is as visible as what is not. */
+  const got = new Set(game._fired.filter(([i]) => i <= idx).map(([, a]) => a));
+  const now = new Set((f.fired || "").split(" ").filter(Boolean));
+  const all = game.record.achievements || [];
+  el("ach-hint").textContent = `${got.size} of ${all.length} this run · ${f.score} points`;
+  box.innerHTML = `<div class="ach">` + all.map((a) =>
+    `<b class="${now.has(a) ? "now" : got.has(a) ? "got" : ""}">${esc(a)}</b>`
+  ).join("") + `</div>`;
+}
+
+const calls = (b) => b.work.filter((m) => m.kind === "tool").length;
+let wideOpen = false;   /* kept across batches, so scrubbing stays open */
+
+function renderWork(f) {
+  const b = game.batches[f.b];
+  const box = el("offboard");
+  const all = b ? b.work : (game.batches[0] ? game.batches[0].work : []);
+  /* The CLI hands back thinking blocks with the content encrypted, so a row per
+     block would be a column of identical placeholders. Counted in the header
+     instead: the session reasoned here, and this does not pretend to show it. */
+  const work = all.filter((m) => m.kind !== "think");
+  const sealed = all.length - work.length;
+  el("off-hint").textContent =
+    (b ? `before batch ${f.b + 1}` : "before the first action") +
+    ` · ${plural(calls(b || { work: all }), "call")}` +
+    (sealed ? ` · ${sealed} sealed reasoning` : "") + ` · costs no budget`;
+  if (!work.length) {
+    box.innerHTML = `<p class="empty">It played straight on from the last batch —
+      no shell, no scripts, nothing read${sealed ? ", only " +
+      plural(sealed, "reasoning block") + " the CLI returned encrypted" : ""}.</p>`;
+    return;
+  }
+  box.innerHTML = work.map(renderMoment).join("");
+  if (wideOpen) box.querySelectorAll("pre.full").forEach((pre) => {
+    pre.hidden = false;
+    pre.closest(".evt").querySelector("button.more").textContent = "hide";
+  });
+  box.querySelectorAll("button.more").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pre = btn.closest(".evt").querySelector("pre.full");
+      pre.hidden = !pre.hidden;
+      btn.textContent = pre.hidden ? "show" : "hide";
+    });
+  });
+}
+
+/* A command's first line is `./python -c "` more often than not, so the label is
+   the whole thing with its whitespace flattened — what it ran is then in the
+   label rather than behind the toggle. */
+function oneline(s, n) {
+  const flat = String(s).replace(/\s+/g, " ").trim();
+  return flat.length > n ? flat.slice(0, n) + "…" : flat;
+}
+
+function renderMoment(m) {
+  if (m.kind === "say") {
+    return `<div class="evt"><div class="top"><span class="tag">said</span></div>
+      <div class="said">${esc(m.text)}</div></div>`;
+  }
+  if (m.kind === "think") {
+    return `<div class="evt"><div class="top"><span class="tag">thought</span></div>
+      <div class="sealed">reasoning block, returned encrypted by the CLI</div></div>`;
+  }
+  const wrote = m.body && (m.name === "Write" || m.name === "Edit");
+  const shownText = [m.body, m.out].filter(Boolean).join("\n\n— output —\n");
+  return `<div class="evt">
+    <div class="top">
+      <span class="tag ${esc(m.name)}">${esc(m.name)}</span>
+      <span class="name">${esc(oneline(m.title, 150))}</span>
+      ${shownText ? `<button class="more">show</button>` : ""}
+    </div>
+    ${m.why ? `<div class="why">${esc(m.why)}</div>` : ""}
+    ${m.images ? `<div class="eyed">${plural(m.images, "image")} into context</div>` : ""}
+    ${shownText ? `<pre class="code ${m.error ? "err" : ""} full" hidden>${
+      esc((wrote ? m.title + "\n\n" : "") + m.body + (m.body && m.out ? "\n\n" : "") + m.out)
+    }</pre>` : ""}
+  </div>`;
+}
+
+/* ── driving ────────────────────────────────────────────────────────────── */
+function show(i) {
+  idx = Math.max(0, Math.min(game.frames.length - 1, i));
+  const f = game.frames[idx];
+  const at = nearest(idx);
+  el("stage").src = src(at);
+  const stale = el("stale");
+  stale.hidden = at === idx;
+  if (at !== idx) stale.textContent = `picture from action ${game.frames[at].n}`;
+  prefetch(idx);
+  el("slider").value = String(idx);
+  el("head").style.left = (100 * (idx + 0.5)) / game.frames.length + "%";
+  el("counter").textContent = `frame ${idx + 1} / ${game.frames.length}`;
+  renderNow(f);
+  renderIntent(f);
+  renderAch(f);
+  renderWork(f);
+}
+
+function jumpBatch(dir) {
+  const want = game.frames[idx].b + dir;
+  const target = game.frames.findIndex((f) => f.b === want);
+  if (target >= 0) show(target);
+  else show(dir > 0 ? game.frames.length - 1 : 0);
+}
+
+/* An achievement, a change of level or a life ending — the moments worth walking
+   between on a run three thousand actions long. */
+function jumpEvent(dir) {
+  const interesting = (f) => f.fired || f.dlevel || f.events.length;
+  for (let i = idx + dir; i >= 0 && i < game.frames.length; i += dir) {
+    if (interesting(game.frames[i])) return show(i);
+  }
+  show(dir > 0 ? game.frames.length - 1 : 0);
+}
+
+function stop() {
+  if (timer) { clearInterval(timer); timer = null; el("play").textContent = "▶ play"; }
+}
+
+function toggle() {
+  if (timer) return stop();
+  el("play").textContent = "❚❚ pause";
+  timer = setInterval(() => {
+    if (idx >= game.frames.length - 1) return stop();
+    show(idx + 1);
+  }, 110);
+}
+
+function load(label) {
+  stop();
+  game = DATA.runs.find((g) => g.label === label);
+  shown = new Set(game.shown);
+  document.querySelectorAll("tr.game-row").forEach((r) =>
+    r.setAttribute("aria-current", String(r.dataset.label === label)));
+  const r = game.record, rep = game.report;
+  el("stage-title").textContent = `${game.variant} · seed ${game.seed}`;
+  const audit = rep.audit || { findings: {} };
+  el("stage-hint").textContent =
+    `${r.actions_used} actions · ${r.lives} lives · ${r.deaths} deaths · ` +
+    `${(r.mean_episode_pct ?? 0).toFixed(1)}% mean of ${r.episodes_completed ?? 0} · ` +
+    `audit ${Object.keys(audit.findings || {}).length ? "FLAGGED" : "clean"}`;
+  el("notes").innerHTML = game.notes
+    ? `<pre class="code">${esc(game.notes)}</pre>`
+    : `<p class="empty">This session left no notes.md.</p>`;
+  index();
+  buildTrack();
+  show(0);
+  // clientWidth is 0 until the document has been laid out, and a curve drawn then
+  // is one pixel wide.
+  requestAnimationFrame(drawCurve);
+}
+
+/* ── wiring ─────────────────────────────────────────────────────────────── */
+el("slider").addEventListener("input", (e) => { stop(); show(+e.target.value); });
+el("prev").addEventListener("click", () => { stop(); show(idx - 1); });
+el("next").addEventListener("click", () => { stop(); show(idx + 1); });
+el("prev-batch").addEventListener("click", () => { stop(); jumpBatch(-1); });
+el("next-batch").addEventListener("click", () => { stop(); jumpBatch(1); });
+el("next-event").addEventListener("click", () => { stop(); jumpEvent(1); });
+el("play").addEventListener("click", toggle);
+el("expand-all").addEventListener("click", () => {
+  wideOpen = !wideOpen;
+  el("expand-all").textContent = wideOpen ? "hide all" : "show all";
+  renderWork(game.frames[idx]);
+});
+addEventListener("resize", () => drawCurve());
+document.addEventListener("keydown", (e) => {
+  if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName) && e.target.type !== "checkbox") return;
+  const go = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+  if (go !== undefined) {
+    e.preventDefault(); stop();
+    e.shiftKey ? jumpBatch(go) : show(idx + go);
+  } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault(); stop(); jumpEvent(e.key === "ArrowDown" ? 1 : -1);
+  } else if (e.key === " ") { e.preventDefault(); toggle(); }
+  else if (e.key === "Home") { stop(); show(0); }
+  else if (e.key === "End") { stop(); show(game.frames.length - 1); }
+});
+
+el("footer").innerHTML = `
+  <p><b>What is on this page.</b> Launch ${esc(DATA.launch)}: ${plural(DATA.runs.length, "session")},
+  each given the same brief and the game's own 43 actions by their real names. The
+  observation is the 64-pixel render and nothing else — no state, no positions, no
+  achievement notices. Every frame here is one the session was given.</p>
+  <p><b>Reasoning.</b> The CLI returns its thinking blocks encrypted, so this page
+  cannot show what a session thought — only what it wrote down. That turns out to be
+  most of the story: to move at all it had to state a plan, and to see anything at all
+  it had to write code. Both are here, batch by batch.</p>
+  <p><b>What "off the board" means.</b> Actions are played in batches, and between two
+  of them a session can run as much as it likes for free — scripts that segment the
+  frame into tiles, read the inventory strip, plan a path. The panel under the stage is
+  that work, for the batch you are looking at.</p>
+  <p><b>The score track.</b> ${DATA.replayed
+    ? `Nothing on disk holds the score at a given action — the record is rewritten in
+       place after every one — so it is recovered by replaying the session's own action
+       history through a fresh engine, which is bit-exact in seed and actions. The green
+       curve under the transport is that score; the marks above it are achievements,
+       changes of level and lives ending.`
+    : `This page was built with --no-replay, so it carries no score, level or condition.`}</p>
+  ${DATA.inline ? `<p><b>Frames.</b> A step scrolls the whole view in this game — about
+    half the pixels change — so frames cannot be stored as edits the way a fixed-camera
+    game allows. This file is the self-contained build: every action is on the track,
+    but only the frames that mattered are pictured in full, and runs of plain movement
+    are thinned to fit. An action showing an earlier picture says so on the frame.</p>`
+    : `<p><b>Frames.</b> A step scrolls the whole view — about half the pixels change —
+    so each frame is its own picture, in the directory beside this file, loaded as the
+    cursor reaches it.</p>`}`;
+
+buildMatrix();
+load(DATA.runs[0].label);
+</script>
