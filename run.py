@@ -261,6 +261,20 @@ def refresh_brief(ws: Path) -> None:
     (ws / "CLAUDE.md").write_text(brief(channels) + "\n" + (REPO / "PROMPT.md").read_text())
 
 
+def credential_life(path: Path) -> tuple[float, float]:
+    """When a stored login's access and refresh tokens run out, as POSIX seconds.
+
+    ``(0, 0)`` for anything missing, unreadable or malformed, which makes all three
+    the same answer: this credential is not worth keeping.
+    """
+    try:
+        oauth = json.loads(path.read_text()).get("claudeAiOauth") or {}
+        return (float(oauth.get("expiresAt") or 0) / 1000,
+                float(oauth.get("refreshTokenExpiresAt") or 0) / 1000)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0, 0.0
+
+
 def session_config(root: Path, label: str) -> Path:
     """A config directory of this session's own, seeded with the CLI's credential.
 
@@ -273,19 +287,36 @@ def session_config(root: Path, label: str) -> Path:
     Mitigation and not prevention: an absolute path still reaches the real one, and
     until a sandbox exists only the audit stands there.
 
-    The link is re-seeded rather than left alone, because the CLI does not keep it:
-    when it refreshes a token it writes the file anew, which replaces the symlink
-    with a copy of whatever was current then. That copy expires where the operator's
-    does not, so a launch resumed the next day failed to authenticate in every
-    session that had ever refreshed.
+    The credential is a symlink to the operator's until a session refreshes a token,
+    at which point the CLI writes the file anew and the symlink becomes a copy. Which
+    of the two to keep is decided by which lasts longer, and both directions of that
+    have been wrong here before.
+
+    Leaving the copy alone was wrong: it expires where the operator's does not, so a
+    launch resumed the next day failed to authenticate in every session that had ever
+    refreshed. Re-linking unconditionally is wrong the other way, and only shows up on
+    a run long enough to need several sessions: an access token lasts about eight
+    hours and nothing refreshes the operator's file while a chain is running, so from
+    the second session on the copy is the *newer* of the two and relinking hands the
+    next session a token that has already expired.
+
+    So: keep whichever expires later. A chained run then sustains itself — session one
+    seeds from the operator's file, refreshes when it needs to, and every session
+    after inherits the refreshed copy — for as long as the refresh token lives, which
+    is about a month rather than about eight hours.
     """
     config = root / ".sessions" / label / ".claude"
     config.mkdir(parents=True, exist_ok=True)
     credential = Path.home() / ".claude" / ".credentials.json"
     link = config / ".credentials.json"
-    if credential.exists() and link.resolve() != credential.resolve():
-        link.unlink(missing_ok=True)
-        link.symlink_to(credential)
+    if not credential.exists():
+        return config
+    if link.is_symlink() and link.resolve() == credential.resolve():
+        return config
+    if credential_life(link)[0] > credential_life(credential)[0]:
+        return config
+    link.unlink(missing_ok=True)
+    link.symlink_to(credential)
     return config
 
 
@@ -492,7 +523,7 @@ async def play(
             return report
 
         started = time.monotonic()
-        stderr = ""
+        stderr, idle = "", 0
         try:
             # One run, played by as many sessions as its stint divides it into. The
             # environment is stopped and rebuilt between them rather than held open,
@@ -530,12 +561,21 @@ async def play(
                     # the launcher overruling it rather than continuing it.
                     break
                 if state["actions_used"] <= before:
-                    # It played nothing at all. Another session would start from the
-                    # same place with the same workspace and do the same, so the
-                    # chain stops here rather than burning the budget on retries.
-                    print(f"[{label}] session {n} played no actions — stopping the "
-                          f"chain at {state['actions_used']}/{budget}", flush=True)
-                    break
+                    # It played nothing at all: an API error at startup, an expired
+                    # credential, a session that read the workspace and gave up.
+                    # Costing almost nothing, a retry or two is worth it on a run
+                    # meant to go unattended for hours — but a chain that cannot make
+                    # progress must stop rather than spend the night failing.
+                    idle += 1
+                    if idle > args.retries:
+                        print(f"[{label}] session {n} played no actions, and neither "
+                              f"did the {args.retries} before it — stopping the chain "
+                              f"at {state['actions_used']}/{budget}", flush=True)
+                        break
+                    print(f"[{label}] session {n} played no actions — trying again "
+                          f"({idle} of {args.retries})", flush=True)
+                else:
+                    idle = 0
                 if n >= args.max_sessions:
                     print(f"[{label}] {n} sessions is the limit — stopping at "
                           f"{state['actions_used']}/{budget}", flush=True)
@@ -761,6 +801,9 @@ async def main() -> int:
     )
     parser.add_argument("--max-sessions", type=int, default=100,
                         help="how many sessions a stinted run may chain")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="sessions in a row that may play nothing before the "
+                             "chain gives up")
     parser.add_argument("--obs", nargs="+", choices=CHANNELS, default=list(DEFAULT_CHANNELS),
                         help="which of the package's own observations the sessions get")
     parser.add_argument("--fresh-world", action="store_true",
@@ -777,16 +820,36 @@ async def main() -> int:
     load_dotenv(REPO.parents[1] / ".env")
     args.model = args.model or AGENTS[args.agent].model
     api_key = os.environ.get("ANT_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-    if args.agent == "claude" and not api_key and not args.dry_run:
+    if args.agent == "claude" and not api_key:
         # arc-code hands each session its own key so the bill is per session. With no
         # key the CLI falls back to its own stored login, which works but bills a plan
         # rather than a request — so the cost column becomes whatever the CLI chooses
         # to report, not a measurement.
-        print(
-            "run: no ANT_API_KEY — sessions will use the CLI's own stored login, "
-            "and the cost figures are only as good as what it reports",
-            flush=True,
-        )
+        if not args.dry_run:
+            print(
+                "run: no ANT_API_KEY — sessions will use the CLI's own stored login, "
+                "and the cost figures are only as good as what it reports",
+                flush=True,
+            )
+        # Outside that guard on purpose: a dry run is where you would want to find
+        # out that the login will not last the night, before committing the money.
+        access, refresh = credential_life(Path.home() / ".claude" / ".credentials.json")
+        now = time.time()
+        if not refresh:
+            print("run: no stored login found either — sessions will fail to "
+                  "authenticate. Log in, or set ANT_API_KEY.", flush=True)
+        elif refresh <= now:
+            print(f"run: the stored login's refresh token expired "
+                  f"{(now - refresh) / 86400:.1f} days ago — every session will fail "
+                  f"to authenticate. Log in again before starting.", flush=True)
+        else:
+            # The access token is the short one and it is *not* the one that has to
+            # outlast the run: sessions refresh their own and each inherits the last
+            # one's (see session_config). The refresh token is the deadline.
+            print(f"run: stored login — access token {(access - now) / 3600:+.1f}h, "
+                  f"refresh token {(refresh - now) / 86400:.1f} days. Sessions "
+                  f"refresh their own, so the refresh token is the one that has to "
+                  f"outlast the run.", flush=True)
 
     if args.replay and args.carry_on:
         raise SystemExit(

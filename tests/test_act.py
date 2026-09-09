@@ -539,3 +539,23 @@ def test_again_and_resume_are_opposites(tmp_path):
     )
     assert clash.returncode != 0
     assert "starts the world over" in clash.stdout + clash.stderr
+
+
+def test_the_record_is_replaced_and_never_written_in_place(rig, monkeypatch):
+    """The launcher builds its whole report out of result.json, and a 30,000-action
+    run rewrites it once per action — thirty thousand chances to be killed mid-write.
+    A half-written one would lose the run it was recording."""
+    session, _, env_dir = rig(variant="classic", budget=10, obs=("symbolic",))
+    target = env_dir / act.RESULT
+    seen, real = [], Path.write_text
+
+    def spy(self, *a, **kw):
+        seen.append(Path(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    run(session, ["noop*2"])
+    assert seen, "nothing was written at all"
+    assert target not in seen, "result.json was written in place"
+    assert json.loads(target.read_text())["actions_used"] == 2
+    assert not list(env_dir.glob("*.tmp")), "a temporary file was left behind"

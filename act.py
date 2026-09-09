@@ -159,6 +159,11 @@ class RunState(BaseModel):
         Written after every action rather than at the end: a session that is killed
         still leaves a readable result, and the launcher reads this rather than
         state.json for anything the agent must not see.
+
+        Through a temporary file, like `save`, and for a sharper reason: this is
+        rewritten once per action, so a 30,000-action run offers 30,000 chances to be
+        killed mid-write, and the launcher builds its whole report out of what is
+        here. A half-written one would lose the run it was recording.
         """
         if not self.env_dir:
             return
@@ -179,7 +184,9 @@ class RunState(BaseModel):
             "mean_episode_pct": round(100 * mean / self.max_score, 2) if self.max_score else 0.0,
             "score_pct": round(100 * self.score / self.max_score, 2) if self.max_score else 0.0,
         }
-        Path(self.env_dir, RESULT).write_text(json.dumps(body, indent=2))
+        tmp = Path(self.env_dir, f"{RESULT}.tmp")
+        tmp.write_text(json.dumps(body, indent=2))
+        tmp.replace(Path(self.env_dir, RESULT))
 
     @property
     def actions_left(self) -> int:

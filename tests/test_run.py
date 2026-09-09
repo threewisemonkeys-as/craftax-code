@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -286,12 +287,12 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
                         "score", "score_pct", "lives", "deaths", "unique_cells",
                         "max_level")} | {"episode_scores": [], "achievements": []}))
 
-    def go(stint, max_sessions=3):
+    def go(stint, max_sessions=3, retries=2):
         starts.clear()
         args = type("A", (), {
             "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
             "stint": stint, "max_sessions": max_sessions, "fresh_world": False,
-            "agent": "claude", "model": "m", "dry_run": False,
+            "agent": "claude", "model": "m", "dry_run": False, "retries": retries,
         })()
         report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                       asyncio.Semaphore(1)))
@@ -304,3 +305,118 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
     assert report.sessions == 3, "a stinted run stopped chaining"
     assert all("--resume" in one for one in opened), "a chained session restarted the world"
     assert all("--stint" in one for one in opened)
+
+
+# --------------------------------------------------------------------------- #
+# Surviving the night
+# --------------------------------------------------------------------------- #
+
+
+def credential(path: Path, hours: float, days: float = 30.0) -> Path:
+    """A stored login whose access token has `hours` left and refresh token `days`."""
+    now = time.time() * 1000
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": f"token-{hours}", "refreshToken": "r",
+        "expiresAt": int(now + hours * 3_600_000),
+        "refreshTokenExpiresAt": int(now + days * 86_400_000),
+    }}))
+    return path
+
+
+def test_a_refreshed_credential_is_not_thrown_away(tmp_path, monkeypatch):
+    """The failure this exists to prevent, and it only appears on a run long enough
+    to need several sessions. An access token lasts about eight hours and nothing
+    refreshes the operator's file while a chain is running, so from the second
+    session on the session's own refreshed copy is the newer of the two."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    theirs = credential(home / ".claude" / ".credentials.json", hours=8)
+
+    # Session one: nothing local, so it links to the operator's.
+    config = run.session_config(tmp_path / "launch", "B4XPT")
+    link = config / ".credentials.json"
+    assert link.is_symlink() and link.resolve() == theirs.resolve()
+
+    # Session one refreshes: the CLI replaces the link with a copy of a newer token.
+    link.unlink()
+    credential(link, hours=8)
+    # ...and time passes, so the operator's is now the stale one.
+    credential(theirs, hours=-0.5)
+
+    run.session_config(tmp_path / "launch", "B4XPT")
+    assert not link.is_symlink(), "the refreshed token was replaced by an expired one"
+    assert run.credential_life(link)[0] > time.time()
+
+
+def test_a_stale_local_credential_is_replaced(tmp_path, monkeypatch):
+    """The other direction, which is the bug that put the re-seeding here: a copy
+    left over from a previous launch expires where the operator's does not."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    theirs = credential(home / ".claude" / ".credentials.json", hours=8)
+    config = tmp_path / "launch" / ".sessions" / "B4XPT" / ".claude"
+    credential(config / ".credentials.json", hours=-20)
+
+    run.session_config(tmp_path / "launch", "B4XPT")
+    link = config / ".credentials.json"
+    assert link.is_symlink() and link.resolve() == theirs.resolve()
+
+
+def test_an_unreadable_credential_is_replaced(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    credential(home / ".claude" / ".credentials.json", hours=8)
+    config = tmp_path / "launch" / ".sessions" / "B4XPT" / ".claude"
+    config.mkdir(parents=True)
+    (config / ".credentials.json").write_text("{ this is not json")
+
+    run.session_config(tmp_path / "launch", "B4XPT")
+    assert (config / ".credentials.json").is_symlink()
+    assert run.credential_life(tmp_path / "nothing here") == (0.0, 0.0)
+
+
+def test_a_session_that_plays_nothing_is_retried_and_then_gives_up(tmp_path, monkeypatch):
+    """A run meant to go unattended for hours should not die on one API error at
+    startup — a session that plays nothing costs almost nothing, so a retry is cheap.
+    A chain that cannot make progress must still stop rather than spend the night
+    failing, which is what an expired credential looks like from here."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+    plays = iter([10, 0, 0, 10, 0, 0, 0])  # two idle sessions, then progress, then three
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            state = json.loads((ws / "state.json").read_text())
+            state["actions_used"] += next(plays, 0)
+            (ws / "state.json").write_text(json.dumps(state))
+        return ""
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", lambda *a: _nothing())
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
+        "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
+        "model": "m", "dry_run": False, "retries": 2,
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    # 1 plays, 2 and 3 idle, 4 plays (the counter resets), 5-7 idle and it gives up.
+    assert report.sessions == 7
+    assert run.played(ws) == 20
+
+
+async def _nothing():
+    return "", 0
