@@ -1,9 +1,11 @@
 The brief above says what this environment is. Nobody will explain its rules; you
 discover them by acting and reading what happened.
 
-There is one phase and one budget, and the budget is the whole of what you have. An
-action you leave unspent is worth nothing, and there is no way to give up — so spend
-it, but spend it on experiments rather than on hope.
+There is one phase and one budget, and there is no way to give up — so spend what you
+are given, and spend it on experiments rather than on hope. The budget belongs to the
+run, and how much of it is yours is what `./act status` reports: usually all of it, and
+on a run too long for one session a stint of it, after which this session is over and
+another continues the same run from exactly where you stopped.
 
 ## Acting
 
@@ -43,6 +45,12 @@ Keep durable findings in `notes.md`: what each action does, what each thing you 
 is, what state you are in, what you have ruled out. Your context will compact; files
 survive. Helper scripts are worth keeping too — a parser, a map you are building up, a
 simulator you can re-run all beat re-deriving them.
+
+If you are playing a stint, `notes.md` is also how you talk to the session that takes
+over from you. It gets this workspace and nothing else — not your reasoning, not the
+thing you were about to try next — so a finding you did not write down did not happen.
+Write it as you go rather than at the end: you will not be told which action is your
+last.
 
 ## Playing well
 
@@ -85,5 +93,5 @@ simulator you can re-run all beat re-deriving them.
   and spend what is left on the cheapest experiment that settles the most load-bearing
   one.
 
-Play until `./act status` reports the run is over. Do not stop to ask questions — there
-is nobody to answer them.
+Play until `./act status` says you are done — the run over, or your stint spent. Do not
+stop to ask questions — there is nobody to answer them.

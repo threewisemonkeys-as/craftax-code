@@ -1,5 +1,6 @@
 """The launcher: what a workspace holds, and what it is allowed to be called."""
 
+import asyncio
 import json
 import re
 import subprocess
@@ -171,3 +172,135 @@ def test_rotation_leaves_no_verdict_behind(tmp_path):
     out = tmp_path / run.RIG / "reports"
     assert json.loads((out / "B4XPT-attempt1.json").read_text())["score"] == 2
     assert json.loads((out / "B4XPT.json").read_text())["score"] == 9
+
+
+# --------------------------------------------------------------------------- #
+# Carrying a run on
+# --------------------------------------------------------------------------- #
+
+
+def test_continuable_is_the_opposite_question_to_unfinished(tmp_path):
+    """`--replay` asks which worlds never reached an ending, and starts those over.
+    `--continue` asks which have played anything at all, because a run that spent
+    its budget is exactly the one worth extending."""
+    run.assign_labels(tmp_path, [("craftax", 0), ("craftax", 1), ("classic", 2)])
+    known = json.loads((tmp_path / run.RIG / run.LABELS).read_text())
+    spent, going, untouched = list(known)
+    for label, state in (
+        (spent, {"terminal": True, "outcome": "budget", "actions_used": 3000}),
+        (going, {"terminal": False, "actions_used": 412}),
+        (untouched, {"terminal": False, "actions_used": 0}),
+    ):
+        (tmp_path / label).mkdir()
+        (tmp_path / label / "state.json").write_text(json.dumps(state))
+
+    assert [label for label, _ in run.unfinished(tmp_path)] == [going, untouched]
+    assert sorted(label for label, _ in run.continuable(tmp_path)) == sorted([spent, going])
+    assert run.continuable(tmp_path)[0][1] == (
+        known[run.continuable(tmp_path)[0][0]]["variant"],
+        known[run.continuable(tmp_path)[0][0]]["seed"],
+    )
+    with pytest.raises(SystemExit, match="not a launch directory"):
+        run.continuable(tmp_path / "nowhere")
+
+
+def test_played_reads_the_open_record(tmp_path):
+    assert run.played(tmp_path / "nothing here") == 0
+    (tmp_path / "W").mkdir()
+    (tmp_path / "W" / "state.json").write_text(json.dumps({"actions_used": 7}))
+    assert run.played(tmp_path / "W") == 7
+
+
+def test_the_continuation_task_hands_over_a_run_and_not_a_world():
+    """REPLAY_TASK's world went back to the beginning and only the notes carried
+    over. This one carries the run itself, so what it must not say is that anything
+    has been reset — and what it must say is that the log is too big to read and
+    that this session has a successor of its own."""
+    said = " ".join(run.CONTINUE_TASK.split())
+    assert "already part-played" in said
+    assert "exactly where the last session left it" in said
+    assert "too big to read" in said
+    assert "leave notes.md fit for whoever comes next" in said
+    assert "beginning" not in said and "started again" not in said
+    assert "reports this session is over" in said, "it would play past its stint"
+
+
+def test_a_kept_workspace_gets_the_current_brief(tmp_path):
+    """`--replay` and `--continue` both keep the workspace a previous launch built,
+    and with it whatever CLAUDE.md the harness wrote then. A brief that contradicts
+    the log is worse than a stale one."""
+    ws = run.make_workspace(tmp_path, "B4XPT", ["pixels"])
+    (ws / "state.json").write_text(json.dumps({"obs": ["text"]}))
+    (ws / "notes.md").write_text("what I worked out")
+    (ws / "CLAUDE.md").write_text("a brief from an older harness")
+
+    run.refresh_brief(ws)
+    now = (ws / "CLAUDE.md").read_text()
+    # From the record, not from how this workspace happened to be built.
+    assert "`text/`" in now and "`frames/`" not in now
+    assert "stint" in now, "the prompt that travelled did not carry the handover"
+    assert (ws / "notes.md").read_text() == "what I worked out"
+
+
+def test_the_prompt_says_a_stint_is_not_the_whole_budget():
+    """The pilot ground `reset` because the interface offered a lever the game did
+    not. A prompt that told a stinted session the budget was all its own would be
+    the same mistake in the other direction — it would spend a successor's actions
+    on the assumption they were about to be lost."""
+    said = " ".join((run.REPO / "PROMPT.md").read_text().split())
+    assert "The budget belongs to the run" in said
+    assert "another continues the same run from exactly where you stopped" in said
+    assert "a finding you did not write down did not happen" in said
+    assert "the budget is the whole of what you have" not in said
+
+
+def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
+    """Chaining is what `--stint` turns on. Without one, a session that stops with
+    budget left has decided it is finished, and the launcher does not overrule it —
+    which is how every run behaved before stints existed."""
+    starts, ws = [], tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            starts.append(argv)
+            played = json.loads((ws / "state.json").read_text())
+            played["actions_used"] += 10
+            (ws / "state.json").write_text(json.dumps(played))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        return "", 0
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+
+    def go(stint, max_sessions=3):
+        starts.clear()
+        args = type("A", (), {
+            "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
+            "stint": stint, "max_sessions": max_sessions, "fresh_world": False,
+            "agent": "claude", "model": "m", "dry_run": False,
+        })()
+        report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                      asyncio.Semaphore(1)))
+        return report, list(starts)
+
+    report, opened = go(stint=0)
+    assert report.sessions == 1 and len(opened) == 1
+
+    report, opened = go(stint=10)
+    assert report.sessions == 3, "a stinted run stopped chaining"
+    assert all("--resume" in one for one in opened), "a chained session restarted the world"
+    assert all("--stint" in one for one in opened)

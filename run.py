@@ -6,6 +6,12 @@ world is one long session with its own workspace: the prompt, the log it writes,
 observations it is given, and the notes it keeps. Worlds are independent, so they run
 concurrently.
 
+A run longer than one agent session is played by several of them: ``--stint`` says
+how many actions each may play, and when a stint is spent that session is over and
+the launcher starts the next one from exactly where it stopped. ``--continue`` does
+the same thing to a launch that has already finished, rebuilding its world from the
+recorded history and carrying it on under a larger ``--budget``.
+
 Each session's stream is recorded verbatim to ``agent_stream.jsonl`` — it is both the
 trace to debug from and the source of the cost figures.
 
@@ -36,6 +42,7 @@ import secrets
 import sys
 import time
 from datetime import UTC, datetime
+from itertools import count
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -84,6 +91,25 @@ REPLAY_TASK = (
     "learned still applies. Continue with ./act until `./act status` reports the run "
     "is over. Work autonomously and do not stop to ask questions."
 )
+# The difference from REPLAY_TASK is the whole of why this exists: there, the world
+# went back to the beginning and only the notes carried over. Here the run itself
+# carries over — same life, same inventory, same position — and the session before
+# this one stopped mid-thought because its stint ran out, not because it was done.
+# So the handover is stronger and the instruction has to be too: `logs.txt` is one
+# file for the whole run and is far too large to read, `./act status` and `./act
+# board` are where you are, and notes.md is what the last session managed to say.
+CONTINUE_TASK = (
+    "This run is already part-played and you are the session that continues it. Read "
+    "CLAUDE.md, then notes.md — a previous session wrote it for you and it is the "
+    "only thing it could hand you. `logs.txt` holds every action of the run so far "
+    "and is too big to read: its opening lines document its format, `./act status` "
+    "and `./act board` say where you are now, and anything else you want from it you "
+    "get with a script. The world is exactly where the last session left it — its "
+    "life, what it was carrying, where it stood. Any helper scripts in the workspace "
+    "are yours. Continue with ./act until `./act status` reports this session is "
+    "over, and before it does, leave notes.md fit for whoever comes next. Work "
+    "autonomously and do not stop to ask questions."
+)
 STREAM_LIMIT = 1 << 22  # single stream-json lines can be large
 
 
@@ -102,6 +128,10 @@ class Report(BaseModel):
     audit: Audit = Audit()
     turns: int = 0
     tool_calls: int = 0
+    # How many agent sessions played this run. More than one means it was stinted:
+    # every counter above is the sum over all of them, and every score below is the
+    # run's, because the run is the thing they were all playing.
+    sessions: int = 1
     compactions: int = 0
     cost_usd: float = 0.0
     input_tokens: int = 0
@@ -214,6 +244,23 @@ def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
     return ws
 
 
+def refresh_brief(ws: Path) -> None:
+    """Rewrite a kept workspace's brief from the current GAME.md and PROMPT.md.
+
+    A run that keeps its workspace keeps the CLAUDE.md whatever version of the
+    harness started it wrote, and a brief that contradicts the log is worse than a
+    stale one: a session told "the budget is the whole of what you have" beside a
+    preamble saying it has a stint of it has to decide which to believe.
+
+    The channels come from the record and not from the arguments, for the same
+    reason the world does — they are part of what this run is. Nothing else in the
+    workspace is touched: notes.md and the helper scripts are the session's, and
+    CLAUDE.md is the harness's.
+    """
+    channels = list(json.loads((ws / "state.json").read_text())["obs"])
+    (ws / "CLAUDE.md").write_text(brief(channels) + "\n" + (REPO / "PROMPT.md").read_text())
+
+
 def session_config(root: Path, label: str) -> Path:
     """A config directory of this session's own, seeded with the CLI's credential.
 
@@ -324,6 +371,48 @@ def assign_labels(root: Path, plan: list[tuple[str, int]]) -> dict[str, tuple[st
 # --------------------------------------------------------------------------- #
 
 
+def played(ws: Path) -> int:
+    """Actions this run has spent, from the record the actuator keeps in the open."""
+    state = ws / "state.json"
+    if not state.exists():
+        return 0
+    return int(json.loads(state.read_text())["actions_used"])
+
+
+async def one_session(
+    argv: list[str],
+    ws: Path,
+    env: dict[str, str],
+    report: "Report",
+    agent,
+) -> tuple[str, int]:
+    """Run one agent session to its end, folding its stream into the run's telemetry.
+
+    Appends to `agent_stream.jsonl` rather than truncating it, because the sessions
+    of a stinted run are one run: the audit reads the whole file and the totals in
+    the report are the run's, not the last session's.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=ws,
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,  # codex reads stdin if it is a pipe
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,
+    )
+    # Line-buffered: a run that is killed rather than finished still leaves a
+    # readable transcript, and the file can be watched while it plays.
+    with (ws / "agent_stream.jsonl").open("a", buffering=1) as stream:
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace")
+            stream.write(line)
+            absorb(agent, report, line)
+    stderr = (await proc.stderr.read()).decode(errors="replace")
+    await proc.wait()
+    return stderr, proc.returncode or 0
+
+
 async def play(
     label: str,
     spec: tuple[str, int],
@@ -340,57 +429,119 @@ async def play(
     # achievements unlocked, by name.
     env_dir = root / ".envs" / label
     async with limit:
-        init = [
-            "init",
-            "--variant", variant,
-            "--seed", str(seed),
-            "--budget", str(budget),
-            "--obs", *args.obs,
-            "--env-dir", str(env_dir),
-        ]
-        if args.fresh_world:
-            init.append("--fresh-world")
-        if args.replay:
-            ws = root / label
-            init.append("--again")
+        if args.carry_on:
+            ws, opening = root / label, "resume"
+            refresh_brief(ws)
+            print(f"[{label}] carrying the recorded run on to {budget} actions",
+                  flush=True)
+        elif args.replay:
+            ws, opening = root / label, "again"
+            refresh_brief(ws)  # before `act init --again`, which clears state.json
             print(f"[{label}] replaying with the last session's notes", flush=True)
         else:
-            ws = make_workspace(root, label, args.obs)
-        await act(ws, *init)
+            ws, opening = make_workspace(root, label, args.obs), "fresh"
 
-        report = Report(label=label, variant=variant, seed=seed, obs=list(args.obs),
+        # On a kept workspace the channels are the record's, not the arguments' —
+        # `act --resume` ignores `--obs` for the same reason, and a report that
+        # disagreed with the run would be the only place the two differed.
+        channels = (list(json.loads((ws / "state.json").read_text())["obs"])
+                    if opening == "resume" else list(args.obs))
+        report = Report(label=label, variant=variant, seed=seed, obs=channels,
                         workspace=str(ws), agent=args.agent, model=args.model,
                         budget=budget)
         agent = AGENTS[args.agent]
-        argv = agent.argv(REPLAY_TASK if args.replay else TASK, args.model, ws)
-        env = env | {"CLAUDE_CONFIG_DIR": str(session_config(root, label))}
+
+        def briefed(n: int) -> str:
+            """What session `n` is told it is walking into.
+
+            Only a first session ever meets a world at action zero, and only the
+            first session of a `--replay` meets one that was started over. Every
+            other session in a launch is continuing a run that is already going.
+            """
+            if n > 1 or opening == "resume":
+                return CONTINUE_TASK
+            return REPLAY_TASK if opening == "again" else TASK
+
+        def opened(n: int) -> list[str]:
+            """How the environment is started for session `n` of this run."""
+            out = [
+                "init",
+                "--variant", variant,
+                "--seed", str(seed),
+                "--budget", str(budget),
+                "--stint", str(args.stint),
+                "--obs", *args.obs,
+                "--env-dir", str(env_dir),
+            ]
+            if args.fresh_world:
+                out.append("--fresh-world")
+            # Only the first session of a launch decides how the world begins. Every
+            # session after it resumes, whatever the first one did — including a
+            # fresh run, whose second session picks up the state its first left.
+            if n > 1 or opening == "resume":
+                out.append("--resume")
+            elif opening == "again":
+                out.append("--again")
+            return out
+
         if args.dry_run:
+            await act(ws, *opened(1))
             await act(ws, "stop")
-            print(f"[{label}] ready, not played: {' '.join(argv[:6])} ...", flush=True)
+            shown = " ".join(agent.argv(briefed(1), args.model, ws)[:6])
+            print(f"[{label}] ready, not played: {shown} ...", flush=True)
             return report
 
         started = time.monotonic()
         stderr = ""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=ws,
-                env=env,
-                stdin=asyncio.subprocess.DEVNULL,  # codex reads stdin if it is a pipe
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=STREAM_LIMIT,
-            )
-            # Line-buffered: a run that is killed rather than finished still leaves a
-            # readable transcript, and the file can be watched while it plays.
-            with (ws / "agent_stream.jsonl").open("w", buffering=1) as stream:
-                async for raw in proc.stdout:
-                    line = raw.decode(errors="replace")
-                    stream.write(line)
-                    absorb(agent, report, line)
-            stderr = (await proc.stderr.read()).decode(errors="replace")
-            await proc.wait()
-            report.exit_code = proc.returncode
+            # One run, played by as many sessions as its stint divides it into. The
+            # environment is stopped and rebuilt between them rather than held open,
+            # which costs a replay of the history each time (about 3ms an action) and
+            # buys two things worth more than that: a session cannot mint itself more
+            # actions, because the only thing that grants a stint is a launcher
+            # starting the daemon; and every handover is a clean process, which over
+            # twenty hours matters more than the minutes it costs.
+            for n in count(1):
+                before = played(ws)
+                await act(ws, *opened(n))
+                argv = agent.argv(briefed(n), args.model, ws)
+                # Re-seeded per session and not per run: the CLI replaces the
+                # symlink with a copy of whatever the credential was when it last
+                # refreshed a token, and a chain of sessions can outlive that by
+                # many hours (F13).
+                session_env = env | {"CLAUDE_CONFIG_DIR": str(session_config(root, label))}
+                stderr, report.exit_code = await one_session(
+                    argv, ws, session_env, report, agent)
+                report.sessions = n
+                if report.exit_code:
+                    # Not fatal to the run. The actions it played are recorded and
+                    # the next session rebuilds the world from them; what is lost is
+                    # whatever it had not written down.
+                    print(f"[{label}] session {n} exited {report.exit_code}: "
+                          f"{' '.join(stderr.split())[-200:]}", flush=True)
+
+                state = json.loads((ws / "state.json").read_text())
+                if state["terminal"]:
+                    break
+                if not args.stint:
+                    # Without a stint a run is one session, which is what every run
+                    # was before stints existed. A session that stops with budget
+                    # left has decided it is finished, and starting another would be
+                    # the launcher overruling it rather than continuing it.
+                    break
+                if state["actions_used"] <= before:
+                    # It played nothing at all. Another session would start from the
+                    # same place with the same workspace and do the same, so the
+                    # chain stops here rather than burning the budget on retries.
+                    print(f"[{label}] session {n} played no actions — stopping the "
+                          f"chain at {state['actions_used']}/{budget}", flush=True)
+                    break
+                if n >= args.max_sessions:
+                    print(f"[{label}] {n} sessions is the limit — stopping at "
+                          f"{state['actions_used']}/{budget}", flush=True)
+                    break
+                print(f"[{label}] session {n} handed over at "
+                      f"{state['actions_used']}/{budget} actions", flush=True)
         finally:
             # The environment is a daemon holding a JAX process; a batch of six would
             # otherwise leave six behind, each with its compiled step function.
@@ -435,8 +586,8 @@ async def play(
             f"{report.mean_episode_pct:.1f}% mean of {report.episodes_completed}, "
             f"{report.best_episode_pct:.1f}% best life, {report.score_pct:.1f}% union, "
             f"{report.actions_used}/{report.budget} actions, {report.deaths} deaths, "
-            f"{report.turns} turns, ${report.cost_usd:.2f}, "
-            f"{report.seconds / 60:.1f} min{flag}",
+            f"{report.turns} turns over {report.sessions} session(s), "
+            f"${report.cost_usd:.2f}, {report.seconds / 60:.1f} min{flag}",
             flush=True,
         )
         if not report.ok:
@@ -495,7 +646,7 @@ def summarise(reports: list[Report], root: Path) -> None:
         print("\nno world produced a report — every one of them failed to run")
         return
     print(f"\n{'world':16}  label  mean%    n  best%  union%  actions  lives  deaths  "
-          f"depth   cost   minutes")
+          f"depth  sess   cost   minutes")
     for r in sorted(reports, key=lambda r: (r.variant, r.seed)):
         mark = "" if r.audit.clean else "  AUDIT FAILED"
         world = f"{r.variant}:{r.seed}"
@@ -503,6 +654,7 @@ def summarise(reports: list[Report], root: Path) -> None:
             f"{world:16}  {r.label}  {r.mean_episode_pct:5.1f}  "
             f"{r.episodes_completed:>3}  {r.best_episode_pct:5.1f}  {r.score_pct:6.1f}  "
             f"{r.actions_used:>7}  {r.lives:>5}  {r.deaths:>6}  {r.max_level:>5}  "
+            f"{r.sessions:>4}  "
             f"${r.cost_usd:>5.2f}  {r.seconds / 60:>7.1f}{mark}"
         )
     best = max(r.best_episode_pct for r in reports)
@@ -564,6 +716,23 @@ def unfinished(root: Path) -> list[tuple[str, tuple[str, int]]]:
     return out
 
 
+def continuable(root: Path) -> list[tuple[str, tuple[str, int]]]:
+    """Worlds in a launch that can be carried on from exactly where they stopped.
+
+    Any world that has played an action, *including* one that reached its ending —
+    a run that spent its budget is the case this exists for, since the way a run is
+    extended is to resume it under a larger one. `unfinished` asks the other
+    question, which worlds never reached an ending at all, and is what `--replay`
+    wants: there the world starts over and only the notes survive.
+    """
+    path = rig_dir(root) / LABELS
+    if not path.exists():
+        raise SystemExit(f"run: {path} is missing — this is not a launch directory")
+    known = json.loads(path.read_text())
+    return [(label, (row["variant"], row["seed"]))
+            for label, row in known.items() if played(root / label) > 0]
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(prog="run", description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -575,9 +744,23 @@ async def main() -> int:
         "--replay", metavar="LAUNCH_DIR",
         help="play every unfinished world in a previous launch again, keeping its notes",
     )
+    parser.add_argument(
+        "--continue", dest="carry_on", metavar="LAUNCH_DIR",
+        help="carry every played world in a previous launch on from where it "
+             "stopped, under a larger --budget. The world, the life and the "
+             "inventory are exactly as they were left",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--budget", type=int, default=0,
                         help=f"default {DEFAULT_BUDGET} by variant")
+    parser.add_argument(
+        "--stint", type=int, default=0,
+        help="actions one agent session may play before another takes over the same "
+             "run (0: the whole budget, in one session). A run longer than a session "
+             "needs this",
+    )
+    parser.add_argument("--max-sessions", type=int, default=100,
+                        help="how many sessions a stinted run may chain")
     parser.add_argument("--obs", nargs="+", choices=CHANNELS, default=list(DEFAULT_CHANNELS),
                         help="which of the package's own observations the sessions get")
     parser.add_argument("--fresh-world", action="store_true",
@@ -605,7 +788,29 @@ async def main() -> int:
             flush=True,
         )
 
-    if args.replay:
+    if args.replay and args.carry_on:
+        raise SystemExit(
+            "run: --replay starts the world over and --continue carries it on — "
+            "they are opposites"
+        )
+    if args.carry_on:
+        root = Path(args.carry_on)
+        if not args.budget:
+            raise SystemExit(
+                "run: --continue needs a --budget to continue to. Resuming under the "
+                "budget a run already spent would rebuild it and stop."
+            )
+        plan = continuable(root)
+        spent = {label: played(root / label) for label, _ in plan}
+        plan = [(label, spec) for label, spec in plan if spent[label] < args.budget]
+        for label, done in sorted(spent.items()):
+            if done >= args.budget:
+                print(f"[{label}] already played {done} of the {args.budget} asked "
+                      f"for — nothing to continue", flush=True)
+        if not plan:
+            raise SystemExit(f"run: nothing in {root} to continue to {args.budget}")
+        print(f"continuing {len(plan)} worlds in {root} to {args.budget} actions")
+    elif args.replay:
         root = Path(args.replay)
         plan = unfinished(root)
         if not plan:
@@ -616,6 +821,15 @@ async def main() -> int:
         chosen = specs(args)
         plan = [(label, spec) for label, spec in assign_labels(root, chosen).items()
                 if spec in chosen]
+
+    longest = max(args.budget or DEFAULT_BUDGET[variant] for _, (variant, _) in plan)
+    if not args.stint and longest > 2 * DEFAULT_BUDGET["craftax"]:
+        print(
+            f"run: {longest} actions with no --stint is one agent session playing all "
+            f"of them, which at the pilot's rate is over a day in one process. "
+            f"--stint {DEFAULT_BUDGET['craftax']} plays it as a chain of sessions.",
+            flush=True,
+        )
 
     env = child_env(api_key)
     limit = asyncio.Semaphore(args.concurrency)

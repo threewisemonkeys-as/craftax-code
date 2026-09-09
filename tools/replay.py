@@ -561,9 +561,17 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
                 k: record.get(k) for k in (
                     "actions_used", "budget", "score", "score_pct", "best_episode",
                     "best_episode_pct", "mean_episode", "mean_episode_pct",
-                    "episodes_completed", "episode_scores", "achievements", "lives",
+                    "episodes_completed", "episode_scores", "lives",
                     "deaths", "max_level", "unique_cells", "max_score",
                 )
+            } | {
+                # From the replay and not from `record["achievements"]`. A run
+                # records the names its own code knew, and the pilot's were written
+                # before the naming fix (91a0473), so a third of them name the wrong
+                # achievement — 46 points' worth of vector read out as 77 points'
+                # worth of names. The vector was always right, so replaying it under
+                # the current spec is what says what actually fired.
+                "achievements": sorted({a for r in rows for a in r["fired"].split() if a}),
             },
             "frames": frames, "batches": made, "looked": looked, "derived": derived,
             "curve": curve,

@@ -6,7 +6,7 @@ contract — every action goes through here, every action is appended verbatim t
 ``logs.txt`` next to the observation it produced, and nothing degrades gracefully.
 If something is wrong, it raises.
 
-Three things differ from the humanRL port it is cut down from:
+Four things differ from the humanRL port it is cut down from:
 
 * **There is no win.** Those games ended when the player touched the princess, so a
   reward above zero ended the run. Craftax is open-ended: a life ends in death, in
@@ -22,6 +22,14 @@ Three things differ from the humanRL port it is cut down from:
 * **The observation is whatever the run was configured to give.** ``CraftaxGame``
   owns that; this file writes one ``[channel] path`` line per channel and never
   asks what is in any of them.
+* **A run can outlive the session playing it.** 30,000 actions is a day of wall
+  clock and far more context than one session holds, so ``--stint`` divides a run
+  between several: when a session's stint is spent that session is over and the run
+  is not. ``--resume`` then rebuilds the world by replaying the recorded history —
+  which works because the world is a pure function of the seed and the actions, and
+  is checked rather than assumed — and hands it to the next session. What carries
+  across is the workspace: the notes, the scripts, the log and the observations.
+  Nothing else does, which is why the prompt tells a session to write things down.
 
 The rule the whole harness rests on is unchanged: **the log tells the agent about
 the protocol, never about the world.**
@@ -35,6 +43,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from itertools import count
 from pathlib import Path
@@ -108,6 +117,20 @@ class RunState(BaseModel):
     plan: str | None = None
     history: list[str] = []
 
+    # -- the stint ----------------------------------------------------------- #
+    # A run longer than one session is a run played by several of them, and `stint`
+    # is how many actions each may play before it is over and the next takes over
+    # from exactly where it stopped. 0 means the whole budget, which is what a
+    # single-session run has and what every run had before 30k ones existed.
+    #
+    # This is protocol and not world: it says nothing about what is being played,
+    # and the preamble explains it in the same breath as the budget. It also makes
+    # notes.md load-bearing rather than merely advised — a successor session has the
+    # workspace and nothing else.
+    stint: int = 0
+    stint_end: int = 0
+    sessions: int = 1
+
     # -- the score ----------------------------------------------------------- #
     # Read off the engine after every action and never shown. The achievement names
     # in particular are the tech tree: told that `make_wood_pickaxe` had fired, a
@@ -162,6 +185,27 @@ class RunState(BaseModel):
     def actions_left(self) -> int:
         return self.budget - self.actions_used
 
+    @property
+    def stint_left(self) -> int:
+        """Actions left in this session's share, which is the budget without one."""
+        if not self.stint:
+            return self.actions_left
+        return min(self.actions_left, self.stint_end - self.actions_used)
+
+    @property
+    def stint_over(self) -> bool:
+        """This session is done and the run is not. Distinct from `terminal`.
+
+        A stint that runs out at the same moment the budget does is the run ending,
+        not a handover, so a terminal run is never reported this way.
+        """
+        return bool(self.stint) and not self.terminal and self.stint_left <= 0
+
+    def begin_stint(self, size: int) -> None:
+        """Hand the next `size` actions to a new session."""
+        self.stint = size
+        self.stint_end = self.actions_used + size if size else 0
+
 
 # --------------------------------------------------------------------------- #
 # The log format every parser downstream depends on
@@ -209,6 +253,7 @@ def preamble(state: RunState, tokens: tuple[str, ...], channels: dict[str, str])
         f"# budget: {state.budget} actions for the whole run, across every life.\n"
         f"#   Every action counts. There is one phase and nothing is held back for\n"
         f"#   later.\n"
+        f"{stint_note(state)}"
         f"# [event] lines are things the actuator did that you did not ask for:\n"
         f"#   life over — this life ended and the next one began in the same world.\n"
         f"#     The actions already spent stay spent. That block holds two\n"
@@ -216,6 +261,23 @@ def preamble(state: RunState, tokens: tuple[str, ...], channels: dict[str, str])
         f"#     the life ended in, and then a `-restart` one, the state the next\n"
         f"#     life began in.\n"
         f"#   run over — the budget is spent and nothing further can be played.\n"
+        f"#   session over — your stint is spent. See `stint` above.\n"
+        f"#   resumed — the actuator was restarted and rebuilt this run from its\n"
+        f"#     record. The world is exactly as the last action left it.\n"
+    )
+
+
+def stint_note(state: RunState) -> str:
+    """What a session is told about being one of several. Nothing, when it is not."""
+    if not state.stint:
+        return ""
+    return (
+        f"# stint: {state.stint} of those actions are yours. The budget belongs to\n"
+        f"#   the run, not to you: when your stint is spent this session is over and\n"
+        f"#   another one continues from exactly where you stopped, in the same\n"
+        f"#   world, with this workspace. It will have your files and nothing else —\n"
+        f"#   not your reasoning, not what you were about to try. `notes.md` is how\n"
+        f"#   you talk to it, and the only way anything you worked out survives.\n"
     )
 
 
@@ -292,6 +354,12 @@ class Session:
         state.max_score = self.game.max_score
         self.last = {}
         self.stopped = False
+        # Set only while `resume` is rebuilding a run from its history. It suppresses
+        # the three things `play` writes — the observation, the log block, the record
+        # — because all three are already on disk from when the action was first
+        # played. Everything else about the control flow is shared, which is what
+        # makes a rebuilt run the same run rather than a similar one.
+        self.replaying = False
 
     @classmethod
     def create(cls, ws: Path, state: RunState) -> "Session":
@@ -307,6 +375,76 @@ class Session:
         state.save(ws)
         state.record()
         return session
+
+    @classmethod
+    def resume(cls, ws: Path, state: RunState, history: list[str]) -> "Session":
+        """Rebuild a run that is already part-played and carry on from where it is.
+
+        The world is not saved anywhere and does not have to be. It is a pure
+        function of the seed and the actions taken — the world key is
+        `fold_in(world_root, 0)` and the key for step *t* of a life is
+        `fold_in(step_root, t)` — so playing the recorded history back into a fresh
+        engine reproduces the exact state the last session left: the map, the
+        inventory, the achievement vector, the position in the day, the monsters.
+
+        What makes this a restoration rather than a re-enactment is that every
+        action goes through `play` like any other, so the life boundaries, the
+        counters and the score come out the way they went in. The check at the end
+        is the proof: a history that does not replay to its own length is not a
+        history of this world.
+
+        About 11ms an action, most of which is the engine's step — a run resumed at
+        27,000 actions costs roughly five minutes of boot. `logs.txt` and the
+        observations are left exactly as they are, because they already hold these
+        actions and this is the same run.
+        """
+        if state.budget < len(history):
+            raise ActError(
+                f"{len(history)} actions have already been played and the budget "
+                f"given is {state.budget} — resuming needs a budget at least as "
+                f"large as what is already spent"
+            )
+        state.actions_used, state.lives = 0, 1
+        state.reward = state.life_reward = 0.0
+        state.terminal, state.outcome = False, ""
+        state.history, state.stint, state.stint_end = [], 0, 0
+
+        session = cls(ws, state)
+        session.replaying = True
+        try:
+            for token in history:
+                session.play(token)
+        finally:
+            session.replaying = False
+        if state.actions_used != len(history):
+            raise ActError(
+                f"the record holds {len(history)} actions but replaying them played "
+                f"{state.actions_used} — this history is not a history of this world"
+            )
+
+        # Written beside the frame the last action produced rather than over it: the
+        # run has not moved, and the observation the previous session was looking at
+        # when it stopped is part of the record.
+        session.last = session.game.observe(ws, state.actions_used, tag="-resume")
+        state.save(ws)
+        state.record()
+        return session
+
+    def announce(self, note: str, tag: str) -> None:
+        """Append a block that no action produced — a handover, not a move."""
+        state = self.state
+        block = [
+            f"\n{SEP}\n",
+            (f"action {state.actions_used} | "
+             f"budget {state.actions_used}/{state.budget} | "
+             f"session {state.sessions}\n\n"),
+            textwrap.fill(f"[event] {tag}: {note}", width=79,
+                          subsequent_indent="        ") + "\n",
+            self.seen(self.last),
+            "\n",
+        ]
+        with (self.ws / LOG).open("a") as log:
+            log.write("".join(block))
 
     # -- helpers ------------------------------------------------------------- #
 
@@ -328,16 +466,27 @@ class Session:
         )
         if state.terminal:
             line += f" outcome {state.outcome}"
+        elif state.stint:
+            line += (
+                f" | session {state.sessions}, {state.stint_left} of your "
+                f"{state.stint} left"
+            )
         return line
 
     def check_budget(self, wanted: int) -> None:
-        if self.state.terminal:
+        state = self.state
+        if state.terminal:
             raise ActError("this run is over — nothing left to play")
-        if wanted > self.state.actions_left:
+        if state.stint_over:
             raise ActError(
-                f"{wanted} actions requested but only {self.state.actions_left} "
-                f"left in the budget"
+                "your stint is spent — this session is over, and the run is not. "
+                "Another session continues from here with this workspace and "
+                "nothing else, so anything you have not written down is lost."
             )
+        if wanted > state.stint_left:
+            whose = ("left in the budget" if state.stint_left == state.actions_left
+                     else "left in your stint")
+            raise ActError(f"{wanted} actions requested but only {state.stint_left} {whose}")
 
     def measure(self) -> None:
         """Read the score off the engine. None of this reaches the workspace."""
@@ -378,7 +527,7 @@ class Session:
         # Written before anything else happens to the world: this is the state the
         # action produced, and for the action that ends a life it is the only view
         # of how that life ended.
-        produced = self.game.observe(self.ws, state.actions_used)
+        produced = self.look()
         body = [self.seen(produced)]
         self.last = produced
 
@@ -393,13 +542,22 @@ class Session:
                 state.lives += 1
                 state.life_reward = 0.0
                 self.measure()
-                restarted = self.game.observe(self.ws, state.actions_used, tag="-restart")
+                restarted = self.look(tag="-restart")
                 body += [f"[event] life over: {how}\n", self.seen(restarted)]
                 self.last = restarted
                 stop = f"life over: {how}"
             case "budget":
                 state.terminal, state.outcome = True, "budget"
                 stop = "budget spent"
+
+        # After the life and the run, because it is the weakest of the three: a
+        # stint that ends on the same action the budget does is the run ending.
+        if state.stint_over:
+            body.append(
+                "[event] session over: your stint is spent. The run is not over — "
+                "another session continues from here.\n"
+            )
+            stop = f"{stop}, and your stint is spent" if stop else "stint spent"
 
         block = [f"\n{SEP}\n{header(state, reward, token, index, total)}\n\n"]
         if state.plan:
@@ -408,14 +566,25 @@ class Session:
         if state.terminal:
             block.append(f"[event] run over: {state.outcome}\n")
         block.append("\n")
-        with (self.ws / LOG).open("a") as log:
-            log.write("".join(block))
-
-        state.save(self.ws)
-        state.record()
+        if not self.replaying:
+            with (self.ws / LOG).open("a") as log:
+                log.write("".join(block))
+            state.save(self.ws)
+            state.record()
         if stop and total - index:
             stop += f", {total - index} action(s) dropped"
         return stop
+
+    def look(self, tag: str = "") -> dict[str, str]:
+        """The observation this action produced — unless the action is being replayed.
+
+        A rebuilt run re-derives the world, not the record. The frames are already on
+        disk from when these actions were first played, and rendering them again
+        would cost a render apiece to write files that are already correct.
+        """
+        if self.replaying:
+            return {}
+        return self.game.observe(self.ws, self.state.actions_used, tag=tag)
 
 
 # --------------------------------------------------------------------------- #
@@ -443,7 +612,12 @@ def cmd_do(args: argparse.Namespace, s: Session) -> str:
 
 def cmd_status(args: argparse.Namespace, s: Session) -> str:
     out = s.summary() + "\n"
-    if not s.state.terminal:
+    if s.state.stint_over:
+        out += (
+            "this session is over — your stint is spent. The run is not over: "
+            "another session continues from here with this workspace.\n"
+        )
+    elif not s.state.terminal:
         out += f"./act do {' '.join(s.playable)}\n"
     return out
 
@@ -490,18 +664,10 @@ def serve(args: argparse.Namespace) -> int:
     env_dir = Path(args.env_dir) if args.env_dir else ws / "env"
     env_dir.mkdir(parents=True, exist_ok=True)
     try:
-        state = RunState(
-            variant=args.variant,
-            seed=args.seed,
-            obs=list(args.obs),
-            fresh_world=args.fresh_world,
-            budget=args.budget or DEFAULT_BUDGET[args.variant],
-            env_dir=str(env_dir),
-        )
         # Building the game compiles `step` and the renderer, which is half a
         # minute. It happens here, before the first command is answered, so that a
         # session's first `./act do` is fast rather than looking hung (F5).
-        session = Session.create(ws, state)
+        session = pick_up(ws, args, env_dir) if args.resume else start(ws, args, env_dir)
         print(f"serving a run on {path}", flush=True)
         while not session.stopped:
             conn, _ = server.accept()
@@ -531,6 +697,65 @@ def serve(args: argparse.Namespace) -> int:
         server.close()
         path.unlink(missing_ok=True)
     return 0
+
+
+def start(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
+    """A run from nothing: a new world, an empty log, action zero."""
+    state = RunState(
+        variant=args.variant,
+        seed=args.seed,
+        obs=list(args.obs),
+        fresh_world=args.fresh_world,
+        budget=args.budget or DEFAULT_BUDGET[args.variant],
+        env_dir=str(env_dir),
+    )
+    # Before `create`, because the preamble it writes is where a session is told it
+    # has a stint at all.
+    state.begin_stint(args.stint)
+    return Session.create(ws, state)
+
+
+def pick_up(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
+    """A run that is already part-played, rebuilt from its own record.
+
+    What the run *is* — the variant, the seed, the channels, whether each life gets a
+    fresh world — comes from the record and never from the arguments. Those four
+    define the world the recorded history is a history of, and a launcher that
+    disagreed with them would rebuild a different world and call it the same run.
+    The budget and the stint are the launcher's to set, and are the only reason this
+    exists: a run is extended by resuming it with a larger budget.
+    """
+    saved = ws / STATE
+    if not saved.exists():
+        raise ActError(f"{ws} holds no run to resume — there is no {STATE}")
+    was = json.loads(saved.read_text())
+    state = RunState(
+        variant=was["variant"],
+        seed=was["seed"],
+        obs=list(was["obs"]),
+        fresh_world=was["fresh_world"],
+        budget=args.budget or was["budget"],
+        env_dir=str(env_dir),
+        sessions=int(was.get("sessions", 1)) + 1,
+    )
+    session = Session.resume(ws, state, list(was["history"]))
+    state.begin_stint(args.stint)
+    grew = state.budget - was["budget"]
+    session.announce(
+        f"this run was rebuilt from its record at action {state.actions_used} and "
+        f"continues. The world is exactly as that action left it."
+        + (f" The budget is now {state.budget}, {grew} more than the blocks above "
+           f"were played under." if grew > 0 else "")
+        + (f" {state.stint} of the {state.actions_left} remaining actions are this "
+           f"session's; the rest belong to the sessions after it." if state.stint else ""),
+        tag="resumed",
+    )
+    # Both, not just state.json: the stint is decided after the rebuild, and the
+    # launcher reads the record rather than the workspace for anything it has to be
+    # sure of.
+    state.save(ws)
+    state.record()
+    return session
 
 
 def read_line(conn: socket.socket) -> bytes:
@@ -580,6 +805,16 @@ ATTEMPT = {
 }
 
 
+def hang_up(ws: Path) -> None:
+    """Shut down whatever daemon is running here, and leave no socket to trust."""
+    if (ws / SOCKET).exists():
+        try:
+            call(ws, "stop", {})
+        except SystemExit:
+            pass
+        (ws / SOCKET).unlink(missing_ok=True)
+
+
 def restart(ws: Path) -> None:
     """Clear the workspace's *world* while leaving its memory alone.
 
@@ -588,12 +823,7 @@ def restart(ws: Path) -> None:
     two runs interleaved in one file would parse as neither. The observations go
     with it for the same reason: frames/000012.png would otherwise mean two states.
     """
-    if (ws / SOCKET).exists():
-        try:
-            call(ws, "stop", {})
-        except SystemExit:
-            pass
-        (ws / SOCKET).unlink(missing_ok=True)
+    hang_up(ws)
     taken = (n for n in count(1)
              if not any((ws / name.format(n=n)).exists() for name in ATTEMPT.values()))
     number = next(taken)
@@ -606,10 +836,23 @@ def restart(ws: Path) -> None:
 
 def cmd_init(args: argparse.Namespace) -> int:
     ws = Path.cwd()
+    if args.again and args.resume:
+        raise ActError("--again starts the world over and --resume continues it")
     if (ws / STATE).exists():
-        if not args.again:
-            raise ActError(f"{ws} already holds a game — use a fresh directory, or --again")
-        restart(ws)
+        if args.resume:
+            # Nothing is rotated and nothing is cleared. The log, the observations
+            # and the record are this run's and the daemon is about to rebuild the
+            # world that produced them; all that has to go is the old socket.
+            hang_up(ws)
+        elif args.again:
+            restart(ws)
+        else:
+            raise ActError(
+                f"{ws} already holds a game — use a fresh directory, --again to "
+                f"start it over, or --resume to carry it on"
+            )
+    elif args.resume:
+        raise ActError(f"{ws} holds no run to resume — there is no {STATE}")
 
     argv = [
         sys.executable,
@@ -618,10 +861,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         "--variant", args.variant,
         "--seed", str(args.seed),
         "--budget", str(args.budget or DEFAULT_BUDGET[args.variant]),
+        "--stint", str(args.stint),
         "--obs", *args.obs,
     ]
     if args.fresh_world:
         argv.append("--fresh-world")
+    if args.resume:
+        argv.append("--resume")
     env_dir = Path(args.env_dir or tempfile.mkdtemp(prefix="act-env-"))
     # mkdtemp makes its own; a directory named by the launcher may not exist yet,
     # and the daemon log below is opened before the daemon runs.
@@ -674,6 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="which of the package's own observations to write")
         p.add_argument("--fresh-world", action="store_true",
                        help="deal a new world on each life instead of replaying this one")
+        p.add_argument("--stint", type=int, default=0,
+                       help="actions one session may play before another takes over "
+                            "(0: the whole budget, in one session)")
+        p.add_argument("--resume", action="store_true",
+                       help="rebuild the run already recorded here and carry it on")
         p.add_argument(
             "--env-dir", default=None,
             help="where the environment's log and the result record go, outside the "
@@ -682,7 +933,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="start a run in this directory")
     add_env_flags(p_init)
-    p_init.add_argument("--again", action="store_true", help="replay, keeping the notes")
+    p_init.add_argument("--again", action="store_true",
+                        help="start the world over, keeping the notes")
     p_init.add_argument("--start-timeout", type=float, default=300.0)
 
     p_serve = sub.add_parser("serve", help=argparse.SUPPRESS)
