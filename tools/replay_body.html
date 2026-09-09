@@ -17,6 +17,26 @@
 
   <div class="picker"><table class="matrix" id="matrix"></table></div>
 
+  <div class="card standing" id="standing">
+    <header>
+      <h2>Where this sits</h2>
+      <span class="hint" id="standing-hint"></span>
+    </header>
+    <div class="body">
+      <div class="standing-grid">
+        <div>
+          <div class="chart-wrap"><canvas id="chart"></canvas></div>
+          <div class="chart-legend" id="chart-legend"></div>
+          <p class="note" id="chart-note"></p>
+        </div>
+        <div>
+          <table class="baselines" id="baselines"></table>
+          <p class="note" id="baseline-note"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="work">
     <div>
       <div class="card">
@@ -191,6 +211,150 @@ function prefetch(i) {
     const j = i + k;
     if (j < game.frames.length && shown.has(j)) new Image().src = src(j);
   }
+}
+
+/* ── where this sits ────────────────────────────────────────────────────────
+   Best single-life return against steps spent, for the six human trajectories and
+   for the run being shown. Best-life rather than session total because a new life
+   re-earns every achievement, so a session sum cannot be compared across runs that
+   died different numbers of times — our seven-life pilot sums to 224 of 226 where
+   its best life is 40.
+
+   The x axis is logarithmic: the runs span 766 steps to 23,225. The y axis is the
+   whole 226, un-zoomed, because that is the finding — every published number and
+   every one of our lives sits in the bottom fifth, and one person went to the top. */
+const MAX = 226;
+let hover = null;      /* step under the pointer, or null */
+
+function chartBox() {
+  const c = el("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(320, c.clientWidth), h = 300;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { g, w, h, pad: { l: 42, r: 14, t: 12, b: 34 } };
+}
+
+function ink(name) {
+  return getComputedStyle(document.body).getPropertyValue(name).trim();
+}
+
+function drawChart() {
+  if (!DATA.replayed) { el("standing").hidden = true; return; }
+  const { g, w, h, pad } = chartBox();
+  const runs = DATA.humans || [];
+  const mine = game ? game.curve || [] : [];
+  const top = Math.max(3000, ...runs.map((r) => r.steps), mine.length ? mine[mine.length - 1][0] : 0);
+  const x = (step) => pad.l + (Math.log10(Math.max(1, step)) / Math.log10(top)) * (w - pad.l - pad.r);
+  const y = (score) => h - pad.b - (score / MAX) * (h - pad.t - pad.b);
+  g.clearRect(0, 0, w, h);
+
+  const line = ink("--line"), soft = ink("--ink-3"), body = ink("--ink-2");
+  g.font = "10px ui-monospace, monospace";
+
+  /* Grid: powers of ten across, twenty points of the 226 up. */
+  g.strokeStyle = line; g.fillStyle = soft; g.lineWidth = 1;
+  for (let p = 2; Math.pow(10, p) <= top; p++) {
+    const at = Math.pow(10, p);
+    g.beginPath(); g.moveTo(x(at), pad.t); g.lineTo(x(at), h - pad.b); g.stroke();
+    g.textAlign = "center";
+    g.fillText(at >= 1000 ? at / 1000 + "k" : String(at), x(at), h - pad.b + 14);
+  }
+  g.textAlign = "right";
+  for (let v = 0; v <= MAX; v += 50) {
+    g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(w - pad.r, y(v)); g.stroke();
+    g.fillText(Math.round((100 * v) / MAX) + "%", pad.l - 6, y(v) + 3);
+  }
+
+  /* The published numbers, as bands across the plot. They are Craftax-Symbolic and
+     this run is pixels, so they are drawn dashed — a reference, not a rival. */
+  g.setLineDash([3, 3]);
+  for (const [name, pct, track] of DATA.baselines) {
+    if (track !== "1B") continue;
+    const at = y((pct / 100) * MAX);
+    g.strokeStyle = line; g.beginPath();
+    g.moveTo(pad.l, at); g.lineTo(w - pad.r, at); g.stroke();
+    g.fillStyle = soft; g.textAlign = "left";
+    g.fillText(name, pad.l + 4, at - 3);
+  }
+  g.setLineDash([]);
+
+  /* The humans, thin and grey — the backdrop. */
+  g.lineWidth = 1.2;
+  runs.forEach((r) => {
+    g.strokeStyle = body; g.globalAlpha = 0.4;
+    g.beginPath();
+    r.curve.forEach(([step, score], i) =>
+      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
+    g.stroke();
+    g.globalAlpha = 1;
+    const [ls, lv] = r.curve[r.curve.length - 1];
+    g.fillStyle = soft; g.textAlign = "left";
+    g.fillText(r.name, Math.min(w - pad.r - 26, x(ls) + 3), y(lv) - 2);
+  });
+
+  /* This run, in the accent. */
+  if (mine.length) {
+    g.strokeStyle = ink("--act"); g.lineWidth = 2.4;
+    g.beginPath();
+    mine.forEach(([step, score], i) =>
+      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
+    g.stroke();
+    /* Where the scrubber is, so the chart and the trajectory are the same object. */
+    const at = game.frames[idx] ? game.frames[idx].n : 0;
+    let hereScore = 0;
+    for (const [step, score] of mine) { if (step <= at) hereScore = score; else break; }
+    if (at > 0) {
+      g.fillStyle = ink("--act");
+      g.beginPath(); g.arc(x(at), y(hereScore), 4, 0, 7); g.fill();
+    }
+  }
+}
+
+function buildLegend() {
+  const mine = game && game.curve && game.curve.length
+    ? game.curve[game.curve.length - 1][1] : 0;
+  const mean = game && game.record ? (game.record.mean_episode ?? 0) - 0.9 : 0;
+  el("chart-legend").innerHTML =
+    `<span><i style="background:${ink("--act")}"></i>this run — best life ` +
+    `${(100 * mine / MAX).toFixed(1)}%, mean of ` +
+    `${game.record.episodes_completed ?? 0} lives ${(100 * mean / MAX).toFixed(1)}%</span>` +
+    `<span><i class="human"></i>${plural((DATA.humans || []).length, "human run")}` +
+    ` from the paper's own dataset</span>` +
+    `<span><i class="dash"></i>published RL, after a billion training steps</span>`;
+  el("chart-note").innerHTML =
+    "<b>Best single-life return</b> against steps spent — best-life rather than " +
+    "session total, because a new life re-earns every achievement and a session sum " +
+    "cannot be compared across runs that died different numbers of times. The table " +
+    "beside this plots a different quantity: <b>mean</b> episode return, which is what " +
+    "the paper reports, and which is lower than the best life whenever a run had a " +
+    "bad one.";
+}
+
+function buildBaselines() {
+  const mine = game && game.record ? (game.record.mean_episode ?? 0) : 0;
+  const rows = DATA.baselines.map(([name, pct, track]) => ({ name, pct, track }));
+  /* The run drops into the ordering rather than sitting outside it — the point of
+     the table is which side of each published number it lands on. */
+  rows.push({ name: "this run", pct: (100 * (mine - 0.9)) / MAX, track: "3k", mine: true });
+  rows.sort((a, b) => b.pct - a.pct);
+  el("baselines").innerHTML =
+    "<tr><th>method</th><th>env steps</th><th>% of 226</th></tr>" +
+    rows.map((r) =>
+      `<tr class="${r.mine ? "mine" : ""}"><td>${esc(r.name)}</td>` +
+      `<td class="track">${r.track === "3k" ? "3,000" : r.track === "1B" ? "1,000,000,000" : "1,000,000"}</td>` +
+      `<td class="num">${r.pct.toFixed(1)}</td></tr>`).join("");
+  el("baseline-note").innerHTML =
+    "Published numbers are mean episode return on <b>Craftax-Symbolic</b>; this run " +
+    "is pixels, which is a different and harder condition. Their step counts are " +
+    "<b>training</b> budgets, measured on fresh episodes afterwards; this run has no " +
+    "training phase, so its 3,000 steps are the learning and the evaluation at once. " +
+    "Its lives also share one world and carry notes between them, where an RL " +
+    "agent's episodes are independent \u2014 an asymmetry in our favour.";
+  el("standing-hint").textContent =
+    `${plural((DATA.humans || []).length, "human run")} \u00b7 ` +
+    `${DATA.baselines.length} published results`;
 }
 
 /* ── the track ──────────────────────────────────────────────────────────── */
@@ -453,6 +617,7 @@ function show(i) {
   renderIntent(f);
   renderAch(f);
   renderWork(f);
+  drawChart();
 }
 
 function jumpBatch(dir) {
@@ -503,10 +668,12 @@ function load(label) {
     : `<p class="empty">This session left no notes.md.</p>`;
   index();
   buildTrack();
+  buildLegend();
+  buildBaselines();
   show(0);
   // clientWidth is 0 until the document has been laid out, and a curve drawn then
   // is one pixel wide.
-  requestAnimationFrame(drawCurve);
+  requestAnimationFrame(() => { drawCurve(); drawChart(); });
 }
 
 /* ── wiring ─────────────────────────────────────────────────────────────── */
@@ -522,7 +689,7 @@ el("expand-all").addEventListener("click", () => {
   el("expand-all").textContent = wideOpen ? "hide all" : "show all";
   renderWork(game.frames[idx]);
 });
-addEventListener("resize", () => drawCurve());
+addEventListener("resize", () => { drawCurve(); drawChart(); });
 document.addEventListener("keydown", (e) => {
   if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName) && e.target.type !== "checkbox") return;
   const go = { ArrowLeft: -1, ArrowRight: 1 }[e.key];

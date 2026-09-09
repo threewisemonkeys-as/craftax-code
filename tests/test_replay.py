@@ -18,12 +18,15 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from replay import (  # noqa: E402
+    BASELINES,
     assign,
+    best_curve,
     attribute,
     batches,
     keep,
     moments,
     read_log,
+    thin,
 )
 
 SEP = "=" * 80
@@ -320,3 +323,68 @@ def test_the_size_estimate_is_a_mean_not_a_midpoint():
     fat = keep(frames, budget=1_000_000, sample=4_000)
     assert len(lean) > len(fat), "a bigger frame must buy fewer of them"
     assert len(lean) <= 1002 and len(fat) <= 252
+
+
+# --------------------------------------------------------------------------- #
+# Where a run sits
+# --------------------------------------------------------------------------- #
+
+
+def test_the_curve_is_best_life_not_session_total():
+    """The quantity the chart plots, and the reason it is that one.
+
+    A new life re-earns every achievement (F12), so a session total counts the same
+    unlock once per death. Two runs that reached exactly the same depth would then be
+    ranked by how often they died — backwards.
+    """
+    # Three lives worth 5, 12 and 3, in that order.
+    rewards = [5, 12, 3]
+    ends = [True, True, True]
+    assert best_curve(rewards, ends) == [5, 12, 12]
+    assert sum(rewards) == 20, "the session total would have said 20"
+
+
+def test_the_curve_only_goes_up_and_a_death_does_not_undo_it():
+    """Monotonic: what a run reached, it reached. The health term makes a step's
+    reward negative without that being a loss of progress."""
+    # The life runs 1, 2, 1.9, 2.9, 2.0 — so the best it ever stood at is 2.9, and
+    # the health cost at the end takes nothing back.
+    curve = best_curve([1, 1, -0.1, 1, -0.9], [False, False, False, False, True])
+    assert curve == [1, 2, 2, 2.9, 2.9]
+    assert curve == sorted(curve)
+
+
+def test_a_life_in_progress_counts_before_it_ends():
+    """Otherwise a run that never died would plot as a flat zero — which is the two
+    expert human runs, both essentially a single life."""
+    assert best_curve([2, 3, 4], [False, False, False]) == [2, 5, 9]
+
+
+def test_thinning_keeps_every_step_where_the_curve_moved():
+    """The steps are log-spaced because the runs span 766 to 23,225, and a sampler
+    that only took its own spacing would miss the achievements — which are the whole
+    shape of the line."""
+    curve = [0.0] * 5000
+    for i in range(3777, 5000):
+        curve[i] = 7.0
+    got = thin(curve, points=40)
+    steps = [s for s, _ in got]
+    assert 3778 in steps, "the one step where anything happened was thinned away"
+    assert len(got) < 200 and got[0][0] == 1 and got[-1][0] == 5000
+    assert [v for _, v in got] == sorted(v for _, v in got)
+
+
+def test_thinning_survives_an_empty_run():
+    assert thin([]) == []
+
+
+def test_the_published_baselines_are_the_paper_s_and_are_labelled_by_track():
+    """A number here that drifted from the paper would be the quietest possible way
+    to make the whole comparison wrong."""
+    by_name = {(n, t): p for n, p, t in BASELINES}
+    assert by_name[("PPO-GTrXL", "1B")] == 18.3
+    assert by_name[("PPO-RNN", "1B")] == 15.3
+    assert by_name[("PQN-RNN", "1B")] == 16.0
+    assert by_name[("Simulus", "1M")] == 6.6
+    assert by_name[("PPO-RNN", "1M")] == 2.3
+    assert {t for _, _, t in BASELINES} == {"1B", "1M"}

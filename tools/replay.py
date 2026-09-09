@@ -47,6 +47,8 @@ import argparse
 import base64
 import io
 import json
+import math
+import os
 import re
 import shutil
 import sys
@@ -60,6 +62,25 @@ import run  # noqa: E402
 
 BODY = ROOT / "tools" / "replay_body.html"
 CSS = ROOT / "tools" / "replay.css"
+# The six human trajectories the Craftax README links, cached as (reward, done) by
+# tools/humans.py. Optional: without them the page simply has no human backdrop.
+HUMAN = Path(os.environ.get("CRAFTAX_HUMAN") or Path.home() / "craftax-human")
+
+# Published results, mean episode return as a percentage of the 226. Craftax-1B is a
+# billion environment steps of training, Craftax-1M a million; both are *training*
+# budgets, and both are measured on Craftax-**Symbolic** — the paper limits its
+# benchmarks to symbolic observations, so a pixels run is a different condition and
+# the table says so rather than quietly comparing across it.
+BASELINES = [
+    ("PPO-GTrXL", 18.3, "1B"),
+    ("PQN-RNN", 16.0, "1B"),
+    ("PPO-RNN", 15.3, "1B"),
+    ("RND", 12.0, "1B"),
+    ("PPO", 11.9, "1B"),
+    ("Simulus", 6.6, "1M"),
+    ("Efficient MBRL", 5.4, "1M"),
+    ("PPO-RNN", 2.3, "1M"),
+]
 
 BLOCK = re.compile(r"^action (\d+) \| budget (\d+)/(\d+)(.*)$")
 # The actuator writes one line per channel, each naming a file: `[pixels] frames/...`.
@@ -334,6 +355,63 @@ def trace(record: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Where a run sits: against the humans, and against the published RL
+# --------------------------------------------------------------------------- #
+def best_curve(rewards, ends) -> list[float]:
+    """The best single-life return reached by step N.
+
+    Monotonic, and it is the quantity the paper reports — mean *episode* return. The
+    obvious alternative, cumulative return over the whole session, cannot be compared
+    across runs that died different numbers of times: a new life re-earns every
+    achievement (F12), so our seven-life pilot sums to 224 of 226 while its best life
+    is 40. The same inflation is in the human table in the plan's F10, mildly: run5's
+    session sums to 31.9% where its best life is 22.6%.
+    """
+    best = current = 0.0
+    out = []
+    for reward, ended in zip(rewards, ends, strict=True):
+        current += float(reward)
+        best = max(best, current)
+        out.append(round(best, 2))
+        if ended:
+            current = 0.0
+    return out
+
+
+def thin(curve: list[float], points: int = 320) -> list[list[float]]:
+    """Log-spaced (step, score) pairs — the runs span 766 to 23,225 steps.
+
+    Every point where the curve *moves* is kept whatever the spacing says: those are
+    the achievements, and they are the whole shape of the line.
+    """
+    if not curve:
+        return []
+    n = len(curve)
+    wanted = {0, n - 1}
+    wanted |= {i for i in range(1, n) if curve[i] != curve[i - 1]}
+    lo, hi = math.log10(1), math.log10(n)
+    wanted |= {min(n - 1, int(10 ** (lo + (hi - lo) * k / points))) for k in range(points)}
+    return [[i + 1, curve[i]] for i in sorted(wanted)]
+
+
+def humans() -> list[dict]:
+    """The six human runs, if the cache is on this disk."""
+    import numpy as np  # noqa: PLC0415
+
+    out = []
+    for path in sorted(HUMAN.glob("cache_run*.npz")):
+        data = np.load(path)
+        curve = best_curve(list(data["reward"]), list(data["done"]))
+        out.append({
+            "name": path.stem.replace("cache_", ""),
+            "steps": len(curve),
+            "final": curve[-1],
+            "curve": thin(curve),
+        })
+    return sorted(out, key=lambda h: -h["final"])
+
+
+# --------------------------------------------------------------------------- #
 # Frames
 # --------------------------------------------------------------------------- #
 def shrink(path: Path, scale: int = SCALE, quality: int = QUALITY) -> bytes:
@@ -369,7 +447,8 @@ def keep(frames: list[dict], budget: int, sample: int) -> list[int]:
     return sorted(must | thinned)
 
 
-def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) -> dict:
+def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool,
+             keep_frames: bool = False) -> dict:
     """Write the frames, and say where they went.
 
     Returns what the page needs: the size to draw at, and either a directory to load
@@ -385,6 +464,13 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) 
 
     if not inline:
         where = out.parent / f"{out.stem}_frames" / label
+        # Editing the page should not cost four minutes of re-encoding frames that
+        # did not change. The count is the check: a run's frames are written once and
+        # never edited, so a complete directory is a correct one.
+        if keep_frames and where.is_dir() and len(list(where.glob("*.webp"))) == len(names):
+            print(f"replay: keeping the {len(names)} frames already under {where}")
+            return {"w": w, "h": h, "dir": f"{out.stem}_frames/{label}",
+                    "shown": list(range(len(frames))), "bytes": 0}
         if where.exists():
             shutil.rmtree(where)
         where.mkdir(parents=True)
@@ -412,7 +498,7 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) 
 # Building the page
 # --------------------------------------------------------------------------- #
 def build(root: Path, out: Path, inline: bool, replay_world: bool,
-          only: str = "") -> dict:
+          only: str = "", keep_frames: bool = False) -> dict:
     labels = json.loads((root / run.RIG / run.LABELS).read_text())
     if only:
         labels = {only: labels[only]}
@@ -465,7 +551,10 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
             frame["dlevel"] = i and frame["level"] != frames[i - 1]["level"]
 
         looked, derived = attribute(said)
-        art = pictures(ws, frames, out, label, inline)
+        # The same quantity as the human backdrop, from the same definition.
+        curve = thin(best_curve([r["reward"] for r in rows],
+                                [not r["alive"] for r in rows])) if rows else []
+        art = pictures(ws, frames, out, label, inline, keep_frames)
         runs.append({
             "label": label, "variant": meta["variant"], "seed": meta.get("seed", 0),
             "report": report or {}, "record": {
@@ -477,13 +566,20 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
                 )
             },
             "frames": frames, "batches": made, "looked": looked, "derived": derived,
+            "curve": curve,
             "notes": (ws / "notes.md").read_text(errors="replace")[:40000]
             if (ws / "notes.md").exists() else "",
             "files": sorted(p.name for p in ws.glob("*.py")),
             **art,
         })
     runs.sort(key=lambda g: (g["variant"], g["seed"]))
-    return {"launch": root.name, "inline": inline, "replayed": replay_world, "runs": runs}
+    people = humans() if replay_world else []
+    if replay_world and not people:
+        print(f"replay: no human runs under {HUMAN} — the chart will have no backdrop")
+    return {
+        "launch": root.name, "inline": inline, "replayed": replay_world,
+        "runs": runs, "humans": people, "baselines": BASELINES,
+    }
 
 
 def main() -> int:
@@ -494,6 +590,10 @@ def main() -> int:
     parser.add_argument(
         "--inline", action="store_true",
         help="one self-contained file; thins runs of plain movement to fit",
+    )
+    parser.add_argument(
+        "--keep-frames", action="store_true",
+        help="reuse the frames already written, for when only the page changed",
     )
     parser.add_argument(
         "--no-replay", action="store_true",
@@ -512,7 +612,8 @@ def main() -> int:
             )
     # Filtered before building rather than after: building a run means writing three
     # thousand frames, and a matrix launch holds one per seed.
-    bundle = build(root, out, args.inline, not args.no_replay, args.label or "")
+    bundle = build(root, out, args.inline, not args.no_replay, args.label or "",
+                   args.keep_frames)
     if not bundle["runs"]:
         raise SystemExit("replay: nothing to show")
 
