@@ -25,6 +25,13 @@ vector from one state (F6). Which of them a run gives out is configuration, and 
 lives here so that ``act.py`` only ever asks for what the run was configured to
 give. Adding a channel must never change how the world steps.
 
+They do not cost the same. Measured per action: the jitted 64px render 25 ms, the
+symbolic vector 0.2 ms, and ``render_craftax_text`` **381 ms** — it builds a Python
+string, so it cannot be jitted and every call re-dispatches its jax work eagerly.
+That is nineteen minutes of wall clock on a 3000-action run. It is upstream's
+function and stays upstream's: re-implementing it faster would make the text
+channel no longer the package's own, which is the only reason it is worth having.
+
 Two upstream facts a caller must not take on trust:
 
 * ``is_terminal`` is true on death, on ``max_timesteps`` **and** on beating the
@@ -360,31 +367,39 @@ class CraftaxGame:
 
         return np.asarray(self._symbolic(self._state))
 
-    def observe(self, into: Path, index: int) -> dict[str, str]:
+    def observe(self, into: Path, index: int, tag: str = "") -> dict[str, str]:
         """Write every enabled channel, and say where each one went.
 
         Uniform across channels on purpose: the text render is 1.8KB per action, and
         inlining it would put five megabytes of world into the one file `PROMPT.md`
         tells the session to read back. Paths keep `logs.txt` scannable.
 
-        Returns channel -> path, relative to `into`. This is the only place that
-        knows which channels a run has, which is what keeps `act.py` from growing a
+        `tag` names a second observation of the same action — the state a run
+        restarted into, written beside the state the action produced rather than
+        over it.
+
+        Returns channel -> path, relative to `into`, in a fixed order so a log
+        block reads the same way every time. This is the only place that knows
+        which channels a run has, which is what keeps `act.py` from growing a
         branch per modality.
         """
         import numpy as np  # noqa: PLC0415
 
         written: dict[str, str] = {}
-        for channel in self.channels:
+        for channel, folder, suffix in (
+            ("pixels", "frames", "png"),
+            ("text", "text", "txt"),
+            ("symbolic", "symbolic", "npy"),
+        ):
+            if channel not in self.channels:
+                continue
+            name = f"{folder}/{index:06d}{tag}.{suffix}"
+            (into / name).parent.mkdir(parents=True, exist_ok=True)
             if channel == "pixels":
-                name = f"frames/{index:06d}.png"
                 self.write_frame(into / name)
             elif channel == "text":
-                name = f"text/{index:06d}.txt"
-                (into / name).parent.mkdir(parents=True, exist_ok=True)
                 (into / name).write_text(self.text())
             else:
-                name = f"symbolic/{index:06d}.npy"
-                (into / name).parent.mkdir(parents=True, exist_ok=True)
                 np.save(into / name, self.symbolic())
             written[channel] = name
         return written

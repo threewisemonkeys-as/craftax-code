@@ -1,0 +1,328 @@
+"""What the actuator promises: one action, one observation, and nothing else said.
+
+`cc_humanrl`'s end-to-end check was the 199-action route that wins every game.
+Craftax has no route and no win, so what is checked here is the protocol instead: a
+batch stops when the state it was planned against is gone, the budget is enforced
+before anything reaches the world, a life ending is not the run ending, and nothing
+the agent can read names the achievement set.
+
+The one addition to that protocol is the reward, which in the humanRL arm was the
+score and so was withheld. Here it is the channel a policy is given, so it is shown
+— and what stays hidden is which achievement paid it.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import act  # noqa: E402
+from act import RunState, Session, parse_tokens  # noqa: E402
+
+# Seed 0 opens with a tree to the left: two steps to face it, then chopping.
+CHOP = ["left", "left", "do", "do", "do"]
+# Standing still is fatal — hunger, thirst and fatigue drain whether or not you act.
+# Exactly 226 actions on craftax and 215 on classic, both from seed 0.
+STARVE = 400
+
+
+@pytest.fixture
+def rig(tmp_path):
+    """A workspace and, somewhere else entirely, the environment's directory."""
+
+    def build(variant="craftax", budget=0, obs=("pixels",), seed=0, fresh_world=False):
+        ws = tmp_path / "ws"
+        ws.mkdir(exist_ok=True)
+        env_dir = tmp_path / "env"
+        env_dir.mkdir(exist_ok=True)
+        state = RunState(
+            variant=variant,
+            seed=seed,
+            obs=list(obs),
+            fresh_world=fresh_world,
+            budget=budget or act.DEFAULT_BUDGET[variant],
+            env_dir=str(env_dir),
+        )
+        return Session.create(ws, state), ws, env_dir
+
+    return build
+
+
+def run(session, tokens, plan=None):
+    args = type("A", (), {"actions": list(tokens), "plan": plan})()
+    return act.cmd_do(args, session)
+
+
+def blocks(ws):
+    return (ws / act.LOG).read_text().split(act.SEP)
+
+
+# --------------------------------------------------------------------------- #
+# The run
+# --------------------------------------------------------------------------- #
+
+
+def test_a_run_is_played_in_batches(rig):
+    session, ws, env_dir = rig(budget=40)
+    out = run(session, CHOP, plan="chop whatever is to the left")
+    assert "ran 5/5" in out
+    run(session, ["down"] * 6, plan="walk downhill")
+
+    assert session.state.actions_used == 11
+    assert not session.state.terminal, "eleven actions did not end a 40-action run"
+
+    record = json.loads((env_dir / act.RESULT).read_text())
+    assert record["max_score"] == 226
+    assert "collect_wood" in record["achievements"]
+    assert record["score"] > 0 and record["score_pct"] > 0
+    assert record["episode_scores"] == [record["best_episode"]]
+    assert record["deaths"] == 0
+    assert record["unique_cells"] == 7
+
+    log = (ws / act.LOG).read_text()
+    assert "plan: chop whatever is to the left" in log
+    assert "plan: walk downhill" in log
+
+
+@pytest.mark.parametrize(
+    "obs", [("pixels",), ("text",), ("pixels", "text", "symbolic")]
+)
+def test_one_observation_per_action_per_channel(rig, obs):
+    session, ws, _ = rig(obs=obs)
+    run(session, ["noop"] * 3)
+    log = (ws / act.LOG).read_text()
+    for channel, folder, suffix in (
+        ("pixels", "frames", "png"), ("text", "text", "txt"),
+        ("symbolic", "symbolic", "npy"),
+    ):
+        if channel not in obs:
+            assert not (ws / folder).exists(), f"{channel} was written but not asked for"
+            continue
+        written = sorted(p.name for p in (ws / folder).iterdir())
+        assert written == [f"{i:06d}.{suffix}" for i in range(4)]
+        for name in written:
+            assert f"[{channel}] {folder}/{name}" in log
+
+
+def test_a_death_stops_the_batch_and_the_next_life_begins(rig):
+    """A life ending is not the run ending: the budget carries on, in the same
+    world, and the block holds both the state it ended in and the state it began
+    again in."""
+    session, ws, _ = rig()
+    out = run(session, ["noop"] * STARVE)
+
+    assert "stopped early: life over: death" in out
+    assert "action(s) dropped" in out
+    assert session.state.actions_used == 226
+    assert session.state.deaths == 1
+    assert session.state.lives == 2
+    assert not session.state.terminal, "a death is not the end of the run"
+
+    log = (ws / act.LOG).read_text()
+    # 226 actions, the state before any of them, the restart — and the preamble,
+    # which names the directory too.
+    assert log.count("[pixels] frames/") == 229, "the new life got no frame of its own"
+    assert log.index("[pixels] frames/000226.png") < log.index("[event] life over: death")
+    assert log.index("[event] life over: death") < log.index(
+        "[pixels] frames/000226-restart.png"
+    )
+
+    start = (ws / "frames" / "000000.png").read_bytes()
+    assert (ws / "frames" / "000226.png").read_bytes() != start, "the end is not shown"
+    assert (ws / "frames" / "000226-restart.png").read_bytes() == start, (
+        "the next life did not begin in the same world"
+    )
+
+
+def test_a_life_ending_costs_only_what_was_spent(rig):
+    session, _, _ = rig(budget=500)
+    run(session, ["noop"] * STARVE)
+    assert session.state.actions_left == 500 - 226
+    run(session, CHOP)
+    assert session.state.actions_used == 231
+    assert session.game.alive
+
+
+def test_budget_is_refused_before_the_world_is_touched(rig):
+    session, ws, _ = rig(budget=10)
+    before = (ws / act.LOG).read_text()
+    with pytest.raises(SystemExit, match="only 10 left in the budget"):
+        run(session, ["noop"] * 11)
+    assert session.state.actions_used == 0
+    assert (ws / act.LOG).read_text() == before, "a refused batch played something"
+
+
+def test_budget_ends_the_run(rig):
+    session, ws, env_dir = rig(budget=4)
+    out = run(session, ["noop"] * 4)
+    assert "stopped early: budget spent" in out
+    assert session.state.terminal and session.state.outcome == "budget"
+    assert "[event] run over: budget" in (ws / act.LOG).read_text()
+    assert json.loads((env_dir / act.RESULT).read_text())["score"] == 0
+
+    with pytest.raises(SystemExit, match="this run is over"):
+        run(session, ["noop"])
+
+
+def test_reset_is_an_action_and_is_not_an_event(rig):
+    """`[event]` is what the actuator did unasked. A reset the agent played is not,
+    and it does not count as a death."""
+    session, ws, _ = rig()
+    run(session, CHOP)
+    run(session, ["reset"])
+    assert session.state.actions_used == 6
+    assert session.state.deaths == 0
+    assert session.state.lives == 2
+    log = (ws / act.LOG).read_text()
+    assert "[event] life over" not in log
+    assert (ws / "frames" / "000006.png").read_bytes() == (
+        ws / "frames" / "000000.png"
+    ).read_bytes()
+
+
+def test_the_curve_across_lives_is_kept(rig):
+    """Return per life, in order — the thing no RL baseline has an analogue for."""
+    session, _, env_dir = rig(budget=600)
+    run(session, CHOP)
+    run(session, ["reset"])
+    run(session, ["noop"] * 3)
+    run(session, ["reset"])
+    run(session, CHOP[:3])
+    record = json.loads((env_dir / act.RESULT).read_text())
+    assert len(record["episode_scores"]) == 3, record["episode_scores"]
+    assert record["episode_scores"] == [2, 0, 1], "the same world paid differently"
+    assert record["best_episode"] == 2
+    assert record["score"] == 2, "the union is not the sum of the lives"
+
+
+# --------------------------------------------------------------------------- #
+# What the workspace is allowed to know
+# --------------------------------------------------------------------------- #
+
+
+def test_state_json_names_neither_the_achievements_nor_the_score(rig):
+    """Told that `collect_wood` had fired, a session would know both that wood is a
+    thing and that it has some. The tech tree is the game."""
+    session, ws, _ = rig()
+    run(session, CHOP)
+    body = (ws / act.STATE).read_text()
+    on_disk = json.loads(body)
+    for leak in ("achievements", "score", "max_score", "episodes",
+                 "unique_cells", "max_level", "deaths", "env_dir"):
+        assert leak not in on_disk, f"state.json exposes {leak}"
+    assert "collect_wood" not in body
+    assert set(on_disk) >= {"budget", "actions_used", "lives", "reward", "terminal"}
+
+
+def test_the_log_says_nothing_about_the_observation(rig):
+    """No hash, no changed-pixel count, no summary — the path, and that is all."""
+    session, ws, _ = rig(obs=("pixels", "text"))
+    run(session, CHOP)
+    run(session, ["noop"] * STARVE)  # and through a death, which writes two of each
+    for block in blocks(ws)[1:]:
+        body = [
+            line for line in block.strip().splitlines()
+            if line and not line.startswith(("action ", "plan:", "[event]"))
+        ]
+        assert all(line.startswith(("[pixels] ", "[text] ")) for line in body), body
+
+
+def test_the_reward_is_shown_and_what_paid_it_is_not(rig):
+    session, ws, _ = rig()
+    run(session, CHOP)
+    log = (ws / act.LOG).read_text()
+    assert "| reward +1" in log, "chopping a tree paid nothing the log admits to"
+    assert "collect_wood" not in log
+    assert "achievement" not in log.lower()
+
+
+def test_the_preamble_names_the_actions_the_package_names(rig):
+    """Nothing is withheld about the vocabulary here — the point is the game as
+    shipped, and `make_wood_pickaxe` is what the package calls it."""
+    session, ws, _ = rig()
+    assert session.playable == (*session.game.tokens, "reset")
+    assert len(session.playable) == 44
+    preamble = (ws / act.LOG).read_text().split(act.SEP)[0]
+    for named in ("noop", "left", "do", "make_wood_pickaxe", "cast_fireball", "reset"):
+        assert named in preamble
+    assert "226" not in preamble, "the preamble said how much there is to find"
+
+
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_repeat_syntax():
+    playable = ("left", "do", "make_wood_pickaxe", "reset")
+    assert parse_tokens(["left", "do*3", "make_wood_pickaxe"], playable) == [
+        "left", "do", "do", "do", "make_wood_pickaxe"
+    ]
+    assert parse_tokens(["make_wood_pickaxe*2"], playable) == ["make_wood_pickaxe"] * 2
+    with pytest.raises(SystemExit, match="not an action"):
+        parse_tokens(["jump"], playable)
+    with pytest.raises(SystemExit, match="not an action"):
+        parse_tokens(["k9*2"], playable)
+    with pytest.raises(SystemExit, match="repeats 0 times"):
+        parse_tokens(["left*0"], playable)
+    with pytest.raises(SystemExit, match="no actions given"):
+        parse_tokens([], playable)
+
+
+# --------------------------------------------------------------------------- #
+# The daemon, end to end
+# --------------------------------------------------------------------------- #
+
+
+def act_cli(ws: Path, *args: str) -> str:
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "act.py"), *args],
+        cwd=ws, capture_output=True, text=True, timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout
+
+
+def test_daemon_round_trip(tmp_path):
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    try:
+        act_cli(ws, "init", "--variant", "classic", "--env-dir", str(env_dir),
+                "--budget", "20")
+        assert (ws / "frames" / "000000.png").is_file()
+        out = act_cli(ws, "do", "left*3", "--plan", "walk")
+        assert "ran 3/3: left left left" in out
+        assert "budget 3/20" in act_cli(ws, "status")
+        assert "frames/000003.png" in act_cli(ws, "board")
+        record = json.loads((env_dir / act.RESULT).read_text())
+        assert record["variant"] == "classic" and record["max_score"] == 22
+        # The environment's own directory holds the score, and is not anywhere the
+        # workspace can be confused for.
+        assert not (ws / act.RESULT).exists()
+    finally:
+        subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
+
+
+def test_again_rotates_the_observations_with_the_log(tmp_path):
+    """Two runs interleaved would parse as neither — frames/000012.png must not
+    mean two different states."""
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    try:
+        act_cli(ws, "init", "--variant", "classic", "--env-dir", str(env_dir),
+                "--budget", "20")
+        act_cli(ws, "do", "noop*2")
+        (ws / "notes.md").write_text("what I worked out")
+        act_cli(ws, "init", "--variant", "classic", "--env-dir", str(env_dir),
+                "--budget", "20", "--again")
+        assert (ws / "logs-attempt1.txt").is_file()
+        assert (ws / "frames-attempt1" / "000002.png").is_file()
+        assert sorted(p.name for p in (ws / "frames").iterdir()) == ["000000.png"]
+        assert (ws / "notes.md").read_text() == "what I worked out", "memory was cleared"
+    finally:
+        subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
