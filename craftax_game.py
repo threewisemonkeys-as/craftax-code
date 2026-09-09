@@ -409,6 +409,15 @@ class CraftaxGame:
     # agent can read: naming what it has unlocked would hand it the tech tree one
     # rung at a time.
 
+    def state(self):
+        """The true world: the block grid, the player's position, the inventory.
+
+        For the scripted route in `tools/route.py`, which is a wiring check played
+        harness-side, and for tests. Nothing the agent can reach calls it, and
+        nothing derived from it is written into the workspace.
+        """
+        return self._state
+
     def _flags(self):
         import numpy as np  # noqa: PLC0415
 
