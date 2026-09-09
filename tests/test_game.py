@@ -276,3 +276,45 @@ def test_a_run_with_no_channel_or_an_unknown_one_is_refused():
     with pytest.raises(GameError, match="not one of"):
         CraftaxGame("nethack", seed=0)
     assert set(CHANNELS) == {"pixels", "text", "symbolic"}
+
+
+def test_achievement_names_are_indexed_the_way_the_vector_is():
+    """The package's own level table is the oracle, and it is not the enum.
+
+    `state.achievements` is indexed by `Achievement.value`, and so is
+    ACHIEVEMENT_REWARD_MAP — but iterating the enum yields a different order, because
+    it is declared with the four tiers grouped rather than in value order. Naming by
+    iteration put 42 of the 67 names on the wrong achievement while leaving every score
+    correct, and left the first 25 positions right, so the whole basic tier agreed and
+    nothing caught it until a session reported `enter_graveyard` at depth 1.
+
+    `LEVEL_ACHIEVEMENT_MAP` says which achievement each dungeon level awards, by index.
+    Level 1 is the dungeon and level 8 is the graveyard; if the names are aligned it
+    reads back as its own documentation, and if they are not it reads as nonsense.
+    """
+    import numpy as np
+    from craftax.craftax import constants as C
+
+    from craftax_game import _spec
+
+    spec = _spec("craftax")
+    levels = np.asarray(C.LEVEL_ACHIEVEMENT_MAP)
+    assert spec.achievement_names[int(levels[1])] == "enter_dungeon"
+    assert spec.achievement_names[int(levels[8])] == "enter_graveyard"
+    # And every name is the one whose value is that index.
+    for one in C.Achievement:
+        assert spec.achievement_names[one.value] == one.name.lower()
+    assert len(set(spec.achievement_names)) == len(C.Achievement) == 67
+
+    # The score never depended on this: the reward map is indexed by value too, which
+    # is why the pilot's 16.0% survived the bug that mislabelled its achievements.
+    assert list(spec.rewards) == [C.achievement_mapping(i) for i in range(67)]
+
+
+def test_a_deep_achievement_cannot_fire_at_the_surface():
+    """What the mislabelling looked like from outside: a session at depth 1 reporting
+    the graveyard, which is level 8. Nothing about the tiers should be reachable from
+    an unplayed world."""
+    game = CraftaxGame(seed=0)
+    assert game.achievements_union() == []
+    assert game.max_level == 0

@@ -77,6 +77,12 @@ CAP = 4000
 # Half size: 352x416, which keeps a 64px tile at 32px — every block still legible.
 SCALE = 2
 QUALITY = 72
+# `--inline` is the make-it-fit build, so it spends its budget on *more of the run*
+# rather than on a sharper picture of less of it: a third size still puts a block at
+# 21px, and at 13 KB a frame the must-keeps alone — every batch start, every
+# achievement, every descent and death — came to 9.1 MB before this.
+INLINE_SCALE = 3
+INLINE_QUALITY = 62
 # What `--inline` may spend on pictures, before base64 inflates it by a third and the
 # text of the run — a megabyte and a half of plans, commands and output — is added on
 # top. Set to land near 12 MB against a 16 MB page limit, because the estimate below is
@@ -330,13 +336,13 @@ def trace(record: dict) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Frames
 # --------------------------------------------------------------------------- #
-def shrink(path: Path) -> bytes:
+def shrink(path: Path, scale: int = SCALE, quality: int = QUALITY) -> bytes:
     from PIL import Image  # noqa: PLC0415
 
     im = Image.open(path).convert("RGB")
-    im = im.resize((im.width // SCALE, im.height // SCALE), Image.LANCZOS)
+    im = im.resize((im.width // scale, im.height // scale), Image.LANCZOS)
     buf = io.BytesIO()
-    im.save(buf, "WEBP", quality=QUALITY, method=4)
+    im.save(buf, "WEBP", quality=quality, method=4)
     return buf.getvalue()
 
 
@@ -372,8 +378,10 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) 
     names = [f["name"] for f in frames]
     from PIL import Image  # noqa: PLC0415
 
+    scale = INLINE_SCALE if inline else SCALE
+    quality = INLINE_QUALITY if inline else QUALITY
     with Image.open(ws / names[0]) as probe:
-        w, h = probe.width // SCALE, probe.height // SCALE
+        w, h = probe.width // scale, probe.height // scale
 
     if not inline:
         where = out.parent / f"{out.stem}_frames" / label
@@ -388,13 +396,13 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) 
     # Over several frames, not one: a cave frame and a daylit forest frame differ by
     # more than a factor of two, and sizing the whole run off whichever happened to sit
     # at the midpoint was how the first build came out at 13.7 MB.
-    probes = [len(shrink(ws / names[i]))
+    probes = [len(shrink(ws / names[i], scale, quality))
               for i in range(0, len(names), max(1, len(names) // 8))]
     sample = sum(probes) // len(probes)
     chosen = keep(frames, INLINE_BYTES, sample)
     blobs, total = {}, 0
     for i in chosen:
-        data = shrink(ws / names[i])
+        data = shrink(ws / names[i], scale, quality)
         total += len(data)
         blobs[str(i)] = base64.b64encode(data).decode()
     return {"w": w, "h": h, "dir": "", "shown": chosen, "img": blobs, "bytes": total}
@@ -403,8 +411,11 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) 
 # --------------------------------------------------------------------------- #
 # Building the page
 # --------------------------------------------------------------------------- #
-def build(root: Path, out: Path, inline: bool, replay_world: bool) -> dict:
+def build(root: Path, out: Path, inline: bool, replay_world: bool,
+          only: str = "") -> dict:
     labels = json.loads((root / run.RIG / run.LABELS).read_text())
+    if only:
+        labels = {only: labels[only]}
     reports = {
         path.stem: json.loads(path.read_text())
         for path in sorted((root / run.RIG / "reports").glob("*.json"))
@@ -493,12 +504,15 @@ def main() -> int:
     root = Path(args.launch).expanduser().resolve()
     out = Path(args.out).expanduser().resolve()
     if args.label:
-        chosen = json.loads((root / run.RIG / run.LABELS).read_text())
-        if args.label not in chosen:
-            raise SystemExit(f"replay: {args.label} is not a workspace of this launch")
-    bundle = build(root, out, args.inline, not args.no_replay)
-    if args.label:
-        bundle["runs"] = [g for g in bundle["runs"] if g["label"] == args.label]
+        known = json.loads((root / run.RIG / run.LABELS).read_text())
+        if args.label not in known:
+            raise SystemExit(
+                f"replay: {args.label} is not a workspace of this launch — "
+                f"try one of {', '.join(sorted(known))}"
+            )
+    # Filtered before building rather than after: building a run means writing three
+    # thousand frames, and a matrix launch holds one per seed.
+    bundle = build(root, out, args.inline, not args.no_replay, args.label or "")
     if not bundle["runs"]:
         raise SystemExit("replay: nothing to show")
 

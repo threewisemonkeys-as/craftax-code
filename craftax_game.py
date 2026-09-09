@@ -97,6 +97,25 @@ def _spec(variant: str) -> Spec:
     import jax  # noqa: F401, PLC0415  — imported for its side effects on XLA_FLAGS
     import numpy as np  # noqa: PLC0415
 
+    def named(achievements) -> tuple[str, ...]:
+        """Achievement names in the order the *state vector* uses.
+
+        By `.value`, not by iteration. In Craftax the two disagree: the enum is
+        declared with the four tiers grouped together, so iterating it yields
+        COLLECT_SAPPHIRE (value 54) at position 25, and 42 of the 67 names land on the
+        wrong achievement. The vector `state.achievements` is indexed by value, and so
+        is ACHIEVEMENT_REWARD_MAP — which is why the score was right while the names
+        were wrong, and why every test passed: the first 25 positions agree, and the
+        basic tier is all any test had reached.
+
+        The pilot that finally exposed it reported `enter_graveyard` and
+        `defeat_necromancer` at depth 1, which is not a thing that can happen.
+        """
+        out = [""] * len(achievements)
+        for one in achievements:
+            out[one.value] = one.name.lower()
+        return tuple(out)
+
     if variant == "craftax":
         from craftax.craftax import constants as C  # noqa: PLC0415
         from craftax.craftax.renderer import (  # noqa: PLC0415
@@ -110,7 +129,7 @@ def _spec(variant: str) -> Spec:
         return Spec(
             env_name="Craftax-Symbolic-v1",
             actions=tuple(a.name.lower() for a in C.Action),
-            achievement_names=tuple(a.name.lower() for a in C.Achievement),
+            achievement_names=named(C.Achievement),
             rewards=np.array(C.ACHIEVEMENT_REWARD_MAP),
             max_score=int(np.array(C.ACHIEVEMENT_REWARD_MAP).sum()),
             frame_shape=(832, 704, 3),
@@ -131,7 +150,9 @@ def _spec(variant: str) -> Spec:
     return Spec(
         env_name="Craftax-Classic-Symbolic-v1",
         actions=tuple(a.name.lower() for a in C.Action),
-        achievement_names=tuple(a.name.lower() for a in C.Achievement),
+        # Classic's enum happens to agree with itself, but it is built the same way
+        # rather than relying on that.
+        achievement_names=named(C.Achievement),
         # Classic has no tiers: one point each, so its denominator is the count.
         rewards=np.ones(len(C.Achievement), dtype=int),
         max_score=len(C.Achievement),
