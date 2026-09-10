@@ -420,3 +420,97 @@ def test_a_session_that_plays_nothing_is_retried_and_then_gives_up(tmp_path, mon
 
 async def _nothing():
     return "", 0
+
+
+def test_telemetry_is_banked_across_the_sessions_of_one_run(tmp_path, monkeypatch):
+    """An adapter *assigns* cost and token counts, because the CLI reports one
+    cumulative figure per session — right within a session, and across a chain it
+    keeps only the last one's. The four-session 10,000-action run cost $258 and
+    reported $4.64, its last session's figure."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+    per_session = iter([104.57, 86.30, 13.13, 49.77, 4.64])
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            state = json.loads((ws / "state.json").read_text())
+            state["actions_used"] += 10
+            state["terminal"] = state["actions_used"] >= 50
+            (ws / "state.json").write_text(json.dumps(state))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        # Exactly what Claude.absorb does at the result event: assignment.
+        report.cost_usd = next(per_session, 0.0)
+        report.output_tokens = 1000
+        return "", 0
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 50,
+        "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
+        "model": "m", "dry_run": False, "retries": 2,
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    assert report.sessions == 5
+    assert report.cost_usd == pytest.approx(104.57 + 86.30 + 13.13 + 49.77 + 4.64)
+    assert report.output_tokens == 5000
+
+
+def test_a_session_that_never_reported_banks_nothing_twice(tmp_path, monkeypatch):
+    """A session killed before its result event leaves the fields as the launcher
+    zeroed them, so it contributes nothing — rather than the running total again."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+    reported = iter([10.0, None, 5.0])
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            state = json.loads((ws / "state.json").read_text())
+            state["actions_used"] += 10
+            state["terminal"] = state["actions_used"] >= 30
+            (ws / "state.json").write_text(json.dumps(state))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        got = next(reported, 0.0)
+        if got is not None:      # None = killed before the result event
+            report.cost_usd = got
+        return "", 0
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 30,
+        "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
+        "model": "m", "dry_run": False, "retries": 2,
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    assert report.cost_usd == pytest.approx(15.0)

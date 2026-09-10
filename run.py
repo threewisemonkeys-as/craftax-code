@@ -111,6 +111,13 @@ CONTINUE_TASK = (
     "autonomously and do not stop to ask questions."
 )
 STREAM_LIMIT = 1 << 22  # single stream-json lines can be large
+# Telemetry an adapter *assigns* rather than adds, because the CLI reports one
+# cumulative figure per session: right within a session, and across a chain it would
+# keep only the last session's. The launcher banks each session's contribution and
+# puts the running total back, which leaves both adapters' semantics alone. Before
+# this, a four-session run that cost $258 reported $4.64 — its last session.
+BANKED = ("cost_usd", "input_tokens", "output_tokens",
+          "cache_read_tokens", "cache_creation_tokens")
 
 
 class Report(BaseModel):
@@ -532,8 +539,14 @@ async def play(
             # actions, because the only thing that grants a stint is a launcher
             # starting the daemon; and every handover is a clean process, which over
             # twenty hours matters more than the minutes it costs.
+            banked = dict.fromkeys(BANKED, 0)
             for n in count(1):
                 before = played(ws)
+                # Zeroed so each session contributes exactly its own figures: one
+                # that is killed before its result event contributes nothing rather
+                # than the running total a second time.
+                for field in BANKED:
+                    setattr(report, field, 0)
                 await act(ws, *opened(n))
                 argv = agent.argv(briefed(n), args.model, ws)
                 # Re-seeded per session and not per run: the CLI replaces the
@@ -544,6 +557,9 @@ async def play(
                 stderr, report.exit_code = await one_session(
                     argv, ws, session_env, report, agent)
                 report.sessions = n
+                for field in BANKED:
+                    banked[field] += getattr(report, field)
+                    setattr(report, field, banked[field])
                 if report.exit_code:
                     # Not fatal to the run. The actions it played are recorded and
                     # the next session rebuilds the world from them; what is lost is
