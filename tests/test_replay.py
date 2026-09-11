@@ -388,3 +388,42 @@ def test_the_published_baselines_are_the_paper_s_and_are_labelled_by_track():
     assert by_name[("Simulus", "1M")] == 6.6
     assert by_name[("PPO-RNN", "1M")] == 2.3
     assert {t for _, _, t in BASELINES} == {"1B", "1M"}
+
+
+def test_a_handover_is_a_boundary_and_not_an_action(tmp_path):
+    """A run played by several sessions writes a block where each one took over. It
+    repeats the action number the run stopped at and its played field is `session N`,
+    so left in the stream it becomes a second action 6000 that played "session 3" —
+    duplicating the action number and inventing a one-action batch."""
+    log = (
+        "# preamble\n"
+        + SEP + "\n"
+        "action 0 | budget 0/10000 | start\n\n[pixels] frames/000000.png\n\n"
+        + SEP + "\n"
+        "action 6000 | budget 6000/10000 | reward +1 | do | step 12/12\n\n"
+        "[pixels] frames/006000.png\n\n"
+        + SEP + "\n"
+        "action 6000 | budget 6000/10000 | session 3\n\n"
+        "[event] resumed: this run was rebuilt from its record at action 6000\n"
+        "[pixels] frames/006000-resume.png\n\n"
+        + SEP + "\n"
+        "action 6001 | budget 6001/10000 | reward +0 | left | step 1/4\n\n"
+        "[pixels] frames/006001.png\n\n"
+    )
+    path = tmp_path / "logs.txt"
+    path.write_text(log)
+    blocks = read_log(path)
+
+    kinds = [b["kind"] for b in blocks]
+    assert kinds.count("handover") == 1
+    hand = next(b for b in blocks if b["kind"] == "handover")
+    assert hand["n"] == 6000 and hand["session"] == 3
+
+    played = [b for b in blocks if b["kind"] == "action"]
+    numbers = [b["n"] for b in played]
+    assert numbers == [0, 6000, 6001], numbers
+    assert len(numbers) == len(set(numbers)), "the handover duplicated an action number"
+
+    # And it is not a batch: `step` is what says where a batch begins, and it has none.
+    made = batches(blocks)
+    assert [b["toks"] for b in made] == [["do"], ["left"]]

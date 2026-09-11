@@ -151,6 +151,7 @@ tr.game-row td.what { text-align: left; font-family: var(--sans); font-size: 12.
 .legend-row i.death { background: var(--critical); }
 .legend-row i.fired { background: var(--good); }
 .legend-row i.deep { background: #8b5cf6; }
+.legend-row i.hand { background: var(--ink-3); width: 3px; border-radius: 0; opacity: .6; }
 
 /* ── transport ─────────────────────────────────────────────────────────────
    Five lanes down a 76px track, because a 3000-action run has more to say than a
@@ -170,6 +171,10 @@ tr.game-row td.what { text-align: left; font-family: var(--sans); font-size: 12.
 .mark.death { top: 18px; height: 20px; background: var(--critical); }
 .mark.eye { top: 38px; height: 7px; background: var(--warning); }
 .mark.eye.crop { top: 40px; height: 4px; background: var(--warning); opacity: .5; }
+/* Where one agent session stopped and the next took over the same run. A boundary
+   rather than an event, so it spans the whole track instead of sitting in a lane. */
+.mark.hand { top: 2px; height: 70px; width: 1px; background: var(--ink-3); opacity: .5; }
+.mark.hand::before { content: ""; position: absolute; top: 0; left: -2px; width: 5px; height: 5px; border-radius: 1px; background: var(--ink-3); }
 /* The score as it stood. Most of a long run is flat; the question is where it is not. */
 .curve { position: absolute; left: 0; right: 0; bottom: 0; height: 26px; width: 100%; }
 .head { position: absolute; top: 4px; width: 2px; height: 64px; background: var(--ink); border-radius: 1px; pointer-events: none; }

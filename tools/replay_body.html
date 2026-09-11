@@ -58,6 +58,7 @@
             <span><i class="death"></i> life ended</span>
             <span><i class="eye"></i> looked at <i class="eye crop"></i> crop of it</span>
             <span><i class="load"></i> work before it</span>
+            <span id="hand-key" hidden><i class="hand"></i> a new session takes over</span>
           </div>
           <div class="frame-line" id="frame-name"></div>
           <div class="transport">
@@ -152,6 +153,10 @@ const COLS = [
   ["deaths", (g) => g.record.deaths],
   ["depth", (g) => g.record.max_level],
   ["turns", (g) => g.report.turns ?? "—"],
+  /* From the handovers, not `report.sessions`: that counts the sessions of one
+     launcher invocation, and a run continued from an earlier launch was played by
+     those too. The boundaries in the log are the whole trajectory's. */
+  ["sess", (g) => (g.handovers || []).length + 1],
   ["cost", (g) => g.report.cost_usd != null ? "$" + g.report.cost_usd.toFixed(2) : "—"],
 ];
 
@@ -337,21 +342,27 @@ function buildBaselines() {
   const rows = DATA.baselines.map(([name, pct, track]) => ({ name, pct, track }));
   /* The run drops into the ordering rather than sitting outside it — the point of
      the table is which side of each published number it lands on. */
-  rows.push({ name: "this run", pct: (100 * (mine - 0.9)) / MAX, track: "3k", mine: true });
+  /* Whatever this run actually played. It was 3,000 until a run was continued to
+     10,000, and a table that said 3,000 beside a 10,000-action number would be
+     misreporting the one column the comparison turns on. */
+  const steps = game && game.record ? (game.record.actions_used ?? 0) : 0;
+  rows.push({ name: "this run", pct: (100 * (mine - 0.9)) / MAX, track: "mine", mine: true });
   rows.sort((a, b) => b.pct - a.pct);
+  const budget = { "1B": 1e9, "1M": 1e6 };
   el("baselines").innerHTML =
     "<tr><th>method</th><th>env steps</th><th>% of 226</th></tr>" +
     rows.map((r) =>
       `<tr class="${r.mine ? "mine" : ""}"><td>${esc(r.name)}</td>` +
-      `<td class="track">${r.track === "3k" ? "3,000" : r.track === "1B" ? "1,000,000,000" : "1,000,000"}</td>` +
+      `<td class="track">${(r.mine ? steps : budget[r.track]).toLocaleString("en-US")}</td>` +
       `<td class="num">${r.pct.toFixed(1)}</td></tr>`).join("");
   el("baseline-note").innerHTML =
     "Published numbers are mean episode return on <b>Craftax-Symbolic</b>; this run " +
     "is pixels, which is a different and harder condition. Their step counts are " +
     "<b>training</b> budgets, measured on fresh episodes afterwards; this run has no " +
-    "training phase, so its 3,000 steps are the learning and the evaluation at once. " +
-    "Its lives also share one world and carry notes between them, where an RL " +
-    "agent's episodes are independent \u2014 an asymmetry in our favour.";
+    `training phase, so its ${steps.toLocaleString("en-US")} steps are the learning ` +
+    "and the evaluation at once. Its lives also share one world and carry notes " +
+    "between them, where an RL agent's episodes are independent \u2014 an asymmetry " +
+    "in our favour.";
   el("standing-hint").textContent =
     `${plural((DATA.humans || []).length, "human run")} \u00b7 ` +
     `${DATA.baselines.length} published results`;
@@ -371,6 +382,19 @@ function index() {
     if (!game._first.has(f.b)) game._first.set(f.b, i);
     game._count.set(f.b, (game._count.get(f.b) || 0) + 1);
   });
+  /* A handover names the action the run stopped at, and the session that takes over
+     plays the next one. So the boundary sits before the first frame past that
+     action, which is also how `sessionAt` reads it. */
+  game._hand = (game.handovers || []).map((h) => ({
+    ...h, at: game.frames.findIndex((f) => f.n > h.n),
+  })).filter((h) => h.at >= 0);
+}
+
+/* Which session was playing at a frame. One, unless the run was stinted. */
+function sessionAt(i) {
+  let now = 1;
+  for (const h of game._hand || []) if (i >= h.at) now = h.session;
+  return now;
 }
 
 function buildTrack() {
@@ -419,6 +443,13 @@ function buildTrack() {
       track.appendChild(m);
     }
   });
+  for (const h of game._hand || []) {
+    const m = document.createElement("div");
+    m.className = "mark hand";
+    m.style.left = pct(h.at) + "%";
+    m.title = `action ${h.n} — session ${h.session} takes over\n${h.note || ""}`.trim();
+    track.appendChild(m);
+  }
   el("slider").max = String(n - 1);
   drawCurve();
 }
@@ -472,7 +503,9 @@ function renderNow(f) {
     fact("reward", f.reward ? (f.reward > 0 ? "+" : "") + f.reward : "0") +
     (DATA.replayed ? fact("score", `${f.score}/${game.record.max_score}`) : "") +
     (DATA.replayed ? fact("life", f.life) : "") +
-    (DATA.replayed ? fact("level", f.level) : "");
+    (DATA.replayed ? fact("level", f.level) : "") +
+    ((game._hand || []).length
+      ? fact("session", `${sessionAt(idx)}/${game._hand.length + 1}`) : "");
   el("meters").innerHTML = !DATA.replayed ? "" :
     [["health", f.hp, 9], ["food", f.food, 9], ["drink", f.drink, 9],
      ["energy", f.energy, 9]]
@@ -659,14 +692,17 @@ function load(label) {
   const r = game.record, rep = game.report;
   el("stage-title").textContent = `${game.variant} · seed ${game.seed}`;
   const audit = rep.audit || { findings: {} };
+  const sessions = (game.handovers || []).length + 1;
   el("stage-hint").textContent =
     `${r.actions_used} actions · ${r.lives} lives · ${r.deaths} deaths · ` +
+    (sessions > 1 ? `${sessions} sessions · ` : "") +
     `${(r.mean_episode_pct ?? 0).toFixed(1)}% mean of ${r.episodes_completed ?? 0} · ` +
     `audit ${Object.keys(audit.findings || {}).length ? "FLAGGED" : "clean"}`;
   el("notes").innerHTML = game.notes
     ? `<pre class="code">${esc(game.notes)}</pre>`
     : `<p class="empty">This session left no notes.md.</p>`;
   index();
+  el("hand-key").hidden = !(game.handovers || []).length;
   buildTrack();
   buildLegend();
   buildBaselines();

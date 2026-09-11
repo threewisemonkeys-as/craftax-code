@@ -88,6 +88,10 @@ SEEN = re.compile(r"^\[(pixels|text|symbolic)\] (\S+)$", re.M)
 EVENT = re.compile(r"^\[event\] (.+)$", re.M)
 PLAN = re.compile(r"^plan: (.*)$", re.M | re.S)
 STEP = re.compile(r"step (\d+)/(\d+)")
+# The actuator writes one of these where a session's stint ended and the next rebuilt
+# the world. It is not an action: it repeats the action number the run stopped at, so
+# left in the stream it becomes a second action 6000 whose played token is "session 3".
+HANDOVER = re.compile(r"^session (\d+)$")
 REWARD = re.compile(r"reward ([-+][\d.]+)")
 BUDGET = re.compile(r"budget (\d+)/(\d+)")
 IS_FRAME = re.compile(r"frames/(\d{6})(-restart)?\.png")
@@ -133,11 +137,14 @@ def read_log(path: Path) -> list[dict]:
         played = next((f for f in fields if not f.startswith(("reward", "step"))), "start")
         plan = PLAN.search(rest)
         seen = SEEN.findall(rest)
+        handover = HANDOVER.match(played)
         blocks.append({
             "n": int(found[1]),
             "used": int(found[2]),
             "budget": int(found[3]),
             "tok": played,
+            "kind": "handover" if handover else "action",
+            "session": int(handover[1]) if handover else 0,
             "i": int(step[1]) if step else 0,
             "k": int(step[2]) if step else 0,
             "reward": float(got[1]) if got else 0.0,
@@ -160,6 +167,8 @@ def batches(blocks: list[dict]) -> list[dict]:
     out: list[dict] = []
     for block in blocks:
         if block["n"] == 0:  # the state before anything was played
+            continue
+        if block["kind"] == "handover":  # a session boundary, not an action
             continue
         cont = (
             out
@@ -528,8 +537,21 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
 
         # Every frame the log names, in order. Longer than the action count: the block
         # that ends a life holds two — the state it ended in, and what it began again in.
+        # Where one session stopped and the next took over the same run. Kept as
+        # marks on the transport rather than frames: the observation a handover
+        # writes is the world *unmoved* — the next session rebuilt the state the last
+        # action left — so it is pixel-for-pixel the frame before it, and putting it
+        # in the timeline would be a duplicate image standing for nothing new.
+        handovers = [
+            {"n": block["n"], "session": block["session"],
+             "note": " ".join(" ".join(block["events"]).split())[:400]}
+            for block in blocks if block["kind"] == "handover"
+        ]
+
         frames = []
         for block in blocks:
+            if block["kind"] == "handover":
+                continue
             for i, name in enumerate(block["frames"]):
                 row = by_action.get(block["n"], {})
                 frames.append({
@@ -574,6 +596,7 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
                 "achievements": sorted({a for r in rows for a in r["fired"].split() if a}),
             },
             "frames": frames, "batches": made, "looked": looked, "derived": derived,
+            "handovers": handovers,
             "curve": curve,
             "notes": (ws / "notes.md").read_text(errors="replace")[:40000]
             if (ws / "notes.md").exists() else "",
