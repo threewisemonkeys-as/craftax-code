@@ -118,6 +118,13 @@ STREAM_LIMIT = 1 << 22  # single stream-json lines can be large
 # this, a four-session run that cost $258 reported $4.64 — its last session.
 BANKED = ("cost_usd", "input_tokens", "output_tokens",
           "cache_read_tokens", "cache_creation_tokens")
+# The same accounting one level up. A run can outlive a launch as well as a session —
+# 3,000 actions, continued to 10,000, continued again to 20,000 — and everything the
+# report takes from the record (`actions_used`, the lives, every score) is already the
+# whole run's. These are the fields the launcher counts for itself, so left alone they
+# described a 20,000-action run with the last launch's bill: $169 of the $532 it had
+# actually cost. A continued run picks them up from the report it is continuing.
+CARRIED = ("seconds", "turns", "tool_calls", "compactions", "sessions", *BANKED)
 
 
 class Report(BaseModel):
@@ -379,6 +386,20 @@ def write_report(root: Path, report: "Report") -> Path:
     return path
 
 
+def carried(root: Path, label: str, resuming: bool) -> dict[str, float]:
+    """What this run had already spent before this launch.
+
+    Read from the report this launch will rotate, and only when the run is being
+    continued: `--replay` starts the world over, and what it cost to play a world
+    that no longer exists is not part of what the new one costs.
+    """
+    path = rig_dir(root) / "reports" / f"{label}.json"
+    if not resuming or not path.exists():
+        return dict.fromkeys(CARRIED, 0)
+    was = json.loads(path.read_text())
+    return {field: was.get(field) or 0 for field in CARRIED}
+
+
 def assign_labels(root: Path, plan: list[tuple[str, int]]) -> dict[str, tuple[str, int]]:
     """An opaque name for each (variant, seed), recorded outside every workspace.
 
@@ -484,9 +505,15 @@ async def play(
         # disagreed with the run would be the only place the two differed.
         channels = (list(json.loads((ws / "state.json").read_text())["obs"])
                     if opening == "resume" else list(args.obs))
+        # Seeded here rather than added at the end because the adapters accumulate
+        # into the report as they read the stream: they have to be counting from the
+        # run's total, not from this launch's zero.
+        was = carried(root, label, opening == "resume")
         report = Report(label=label, variant=variant, seed=seed, obs=channels,
                         workspace=str(ws), agent=args.agent, model=args.model,
-                        budget=budget)
+                        budget=budget, turns=int(was["turns"]),
+                        tool_calls=int(was["tool_calls"]),
+                        compactions=int(was["compactions"]))
         agent = AGENTS[args.agent]
 
         def briefed(n: int) -> str:
@@ -539,7 +566,7 @@ async def play(
             # actions, because the only thing that grants a stint is a launcher
             # starting the daemon; and every handover is a clean process, which over
             # twenty hours matters more than the minutes it costs.
-            banked = dict.fromkeys(BANKED, 0)
+            banked = {field: was[field] for field in BANKED}
             for n in count(1):
                 before = played(ws)
                 # Zeroed so each session contributes exactly its own figures: one
@@ -556,7 +583,7 @@ async def play(
                 session_env = env | {"CLAUDE_CONFIG_DIR": str(session_config(root, label))}
                 stderr, report.exit_code = await one_session(
                     argv, ws, session_env, report, agent)
-                report.sessions = n
+                report.sessions = int(was["sessions"]) + n
                 for field in BANKED:
                     banked[field] += getattr(report, field)
                     setattr(report, field, banked[field])
@@ -606,7 +633,7 @@ async def play(
             # already died, `act stop` failed, the exception left this block, and the
             # report — read and written below — was never produced at all. A run that
             # played 2757 actions reported nothing because its shutdown was untidy.
-            report.seconds = time.monotonic() - started
+            report.seconds = was["seconds"] + time.monotonic() - started
             try:
                 await act(ws, "stop")
             except (RuntimeError, OSError) as exc:

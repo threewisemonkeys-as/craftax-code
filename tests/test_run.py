@@ -180,6 +180,36 @@ def test_rotation_leaves_no_verdict_behind(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_a_continued_run_carries_what_it_already_spent(tmp_path):
+    """A run outlives a launch as well as a session, and the bill is the run's.
+
+    Everything the report takes from the record is already cumulative, so a launch
+    that counted only its own turns and dollars described a 20,000-action run with
+    one launch's costs.
+    """
+    run.write_report(tmp_path, run.Report(
+        label="B4XPT", workspace="x", cost_usd=258.42, turns=2061, tool_calls=996,
+        sessions=4, seconds=17458.7, compactions=1, output_tokens=1_314_077))
+    was = run.carried(tmp_path, "B4XPT", resuming=True)
+    assert was["cost_usd"] == 258.42
+    assert was["turns"] == 2061
+    assert was["sessions"] == 4
+    assert was["output_tokens"] == 1_314_077
+    assert set(was) == set(run.CARRIED)
+
+
+def test_a_replay_carries_nothing(tmp_path):
+    """`--replay` starts the world over, and what it cost to play a world that no
+    longer exists is not part of what the new one costs."""
+    run.write_report(tmp_path, run.Report(label="B4XPT", workspace="x", cost_usd=258.42))
+    assert run.carried(tmp_path, "B4XPT", resuming=False) == dict.fromkeys(run.CARRIED, 0)
+
+
+def test_the_first_launch_of_a_run_carries_nothing(tmp_path):
+    """There is no report to continue from, and asking for one must not be an error."""
+    assert run.carried(tmp_path, "B4XPT", resuming=True) == dict.fromkeys(run.CARRIED, 0)
+
+
 def test_continuable_is_the_opposite_question_to_unfinished(tmp_path):
     """`--replay` asks which worlds never reached an ending, and starts those over.
     `--continue` asks which have played anything at all, because a run that spent
