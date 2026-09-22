@@ -649,3 +649,42 @@ def test_a_scan_that_found_nothing_new_looks_the_same_as_the_one_before(tmp_path
     (root / "AAAAA" / "logs.txt").write_text(
         (root / "AAAAA" / "logs.txt").read_text() + "more\n")
     assert watch_replay.fingerprint([root]) != was
+
+
+def test_two_runs_of_one_cli_are_told_apart_by_their_model(tmp_path):
+    """Four arms is two CLIs twice over, and a row named for its CLI alone would name
+    two of them identically. The model is read from the first record that has it: the
+    report once a launch is over, and before that what the CLI kept for itself — a
+    Codex session's own rollout, a Claude stream's `init` event."""
+    sol = launch(tmp_path / "A", "MMMMM", "codex", played=2, budget=10)
+    kept = sol / ".sessions" / "MMMMM" / ".codex" / "sessions" / "2026" / "09" / "22"
+    kept.mkdir(parents=True)
+    (kept / "rollout-x.jsonl").write_text('{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}\n')
+
+    astra = launch(tmp_path / "B", "NNNNN", "codex", played=2, budget=10)
+    (astra / run.RIG / "reports").mkdir(parents=True)
+    (astra / run.RIG / "reports" / "NNNNN.json").write_text(
+        json.dumps({"model": "gpt-6-astra", "fenced": True}))
+
+    fable = launch(tmp_path / "C", "PPPPP", "claude", played=2, budget=10)
+    stream = fable / "PPPPP" / "agent_stream.jsonl"
+    stream.write_text(json.dumps({"type": "system", "subtype": "init",
+                                  "model": "claude-fable-5"}) + "\n" + stream.read_text())
+
+    got = page([sol, astra, fable], tmp_path / "p.html")["runs"]
+    assert [r["arm"] for r in got] == ["claude fable-5", "codex gpt-5.6-sol",
+                                       "codex gpt-6-astra"]
+    # Fenced by the report where there is one, and by the adapter until then.
+    assert [r["fenced"] for r in got] == [False, True, True]
+
+
+def test_the_arm_record_is_read_before_any_report_exists(tmp_path):
+    """A fenced Claude run that is still playing has no report, and the CLI's default
+    says Claude is unfenced — so without the launcher's own record the page would call
+    it unfenced for as long as it played."""
+    root = launch(tmp_path / "A", "PPPPP", "claude", played=2, budget=10)
+    (root / run.RIG / "arms").mkdir(parents=True)
+    (root / run.RIG / "arms" / "PPPPP.json").write_text(json.dumps(
+        {"agent": "claude", "model": "claude-fable-5", "fenced": True}))
+    one, = page([root], tmp_path / "p.html")["runs"]
+    assert one["arm"] == "claude fable-5" and one["fenced"] is True

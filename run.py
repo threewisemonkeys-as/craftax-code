@@ -71,6 +71,11 @@ AGENT_PYTHON = REPO / ".agent-venv" / "bin" / "python"
 # one.
 FENCE = REPO / "rig" / "fence.py"
 
+# The longest a chain will wait between sessions that played nothing. An hour is
+# the shape of the thing being waited out — an exhausted rate window — and waiting
+# longer than one before checking again buys nothing. (From cc_nle, df61c08.)
+MAX_IDLE_WAIT = 3600
+
 # No I, O, 0 or 1: a label is read off a directory listing and typed back by hand.
 LABEL_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LABEL_LEN = 5
@@ -375,12 +380,14 @@ def fenced_argv(agent, argv: list[str], ws: Path, home: Path) -> list[str]:
     the answer instead of playing. That is not hypothetical — see the module
     docstring in rig/fence.py for the session that did it.
 
-    Only the Codex arm is fenced, which is an asymmetry and is recorded as one:
-    `Report.fenced` says which side of it a run was on. The Claude arm's published
-    30k pass had the same reach and never used it, so fencing it now would change a
-    result rather than protect one; fencing this arm makes its score a claim about
-    playing rather than about reading. Both are disclosed; neither is inferred from
-    the other.
+    The Codex arm is fenced by default and the Claude arm is not, which is an
+    asymmetry and is recorded as one: `Report.fenced` says which side of it a run was
+    on. The Claude arm's published 30k pass had the same reach and never used it, so
+    fencing *that* run now would change a result rather than protect one; fencing this
+    arm makes its score a claim about playing rather than about reading. A new Claude
+    run can be fenced with `--fence` — the CLI runs inside it unchanged — and a model
+    with no record of staying in bounds is the case for it. Every run's side is
+    disclosed; none is inferred from another's.
 
     Three kinds of grant, and the difference between them matters:
 
@@ -455,6 +462,25 @@ async def act(ws: Path, *args: str) -> str:
 # --------------------------------------------------------------------------- #
 # Which world is which workspace
 # --------------------------------------------------------------------------- #
+
+
+def write_arm(root: Path, label: str, report: "Report") -> Path:
+    """Who is playing this world, written before the first session starts.
+
+    The report says it too, but a report is written when a launch *ends*, and a page
+    built while the run plays has to tell four arms apart before any of them has
+    ended — by the model, which two runs of one CLI differ in, and by the fence,
+    which a Claude run can now be on either side of. Rewritten on every launch,
+    because a `--continue` could in principle change either.
+    """
+    out = rig_dir(root) / "arms"
+    out.mkdir(exist_ok=True)
+    path = out / f"{label}.json"
+    path.write_text(json.dumps({
+        "agent": report.agent, "model": report.model, "fenced": report.fenced,
+        "effort": getattr(AGENTS[report.agent], "EFFORT", ""),
+    }, indent=2))
+    return path
 
 
 def rig_dir(root: Path) -> Path:
@@ -679,7 +705,8 @@ async def play(
                         workspace=str(ws), agent=args.agent, model=args.model,
                         budget=budget, turns=int(was["turns"]),
                         tool_calls=int(was["tool_calls"]),
-                        fenced=agent.FENCED and not args.no_fence,
+                        fenced=((agent.FENCED or getattr(args, "fence", False))
+                                and not getattr(args, "no_fence", False)),
                         compactions=int(was["compactions"]))
 
         def briefed(n: int) -> str:
@@ -715,6 +742,7 @@ async def play(
                 out.append("--again")
             return out
 
+        write_arm(root, label, report)
         if args.dry_run:
             await act(ws, *opened(1))
             await act(ws, "stop")
@@ -802,8 +830,19 @@ async def play(
                               f"did the {args.retries} before it — stopping the chain "
                               f"at {state['actions_used']}/{budget}", flush=True)
                         break
+                    # The retries were written for a failure that is over by the time
+                    # the next session starts. The one that actually ends a long run
+                    # is not: a rate limit is a window, and retrying inside it three
+                    # times in as many seconds spends the whole allowance of patience
+                    # in under a minute. So the wait doubles, and a chain that means
+                    # to play for a day can afford to sit out an hour of one. cc_nle
+                    # learned this first; a Codex plan's quota is a week-long window,
+                    # which is the same shape with a longer `--retries`.
+                    wait = min(args.idle_wait * 2 ** (idle - 1), MAX_IDLE_WAIT)
                     print(f"[{label}] session {n} played no actions — trying again "
-                          f"({idle} of {args.retries})", flush=True)
+                          f"in {wait / 60:.0f} min ({idle} of {args.retries})",
+                          flush=True)
+                    await asyncio.sleep(wait)
                 else:
                     idle = 0
                 if n >= args.max_sessions:
@@ -1035,12 +1074,22 @@ async def main() -> int:
     parser.add_argument("--retries", type=int, default=2,
                         help="sessions in a row that may play nothing before the "
                              "chain gives up")
+    parser.add_argument("--idle-wait", type=int, default=60,
+                        help="seconds to wait before retrying a session that played "
+                             f"nothing, doubling each time to {MAX_IDLE_WAIT // 60} "
+                             "min. A rate limit is a window, not an error")
     parser.add_argument("--obs", nargs="+", choices=CHANNELS, default=list(DEFAULT_CHANNELS),
                         help="which of the package's own observations the sessions get")
     parser.add_argument("--fresh-world", action="store_true",
                         help="deal a new world on each life instead of replaying this one")
     parser.add_argument("--agent", default="claude", choices=sorted(AGENTS))
-    parser.add_argument(
+    fencing = parser.add_mutually_exclusive_group()
+    fencing.add_argument(
+        "--fence", action="store_true",
+        help="fence an agent that is not fenced by default — a new Claude run, whose "
+             "model has no record yet of staying out of the package",
+    )
+    fencing.add_argument(
         "--no-fence", action="store_true",
         help="run an agent that is normally fenced with the whole disk instead. "
              "For finding out what a session reaches for; not for a measured run",
@@ -1086,6 +1135,10 @@ async def main() -> int:
                   f"refresh token {(refresh - now) / 86400:.1f} days. Sessions "
                   f"refresh their own, so the refresh token is the one that has to "
                   f"outlast the run.", flush=True)
+    if args.agent == "claude" and args.fence:
+        print("run: --fence — these Claude sessions are fenced to their workspace, as "
+              "the Codex arm's are. The published Claude pass was not; the report's "
+              "`fenced` says which side of that this run is on.", flush=True)
     if args.agent == "codex":
         # This CLI has no per-request key to hand a session: it signs in once and
         # every session inherits a copy of that login. So there is one thing to check

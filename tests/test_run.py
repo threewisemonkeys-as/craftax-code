@@ -326,6 +326,7 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
             "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
             "stint": stint, "max_sessions": max_sessions, "fresh_world": False,
             "agent": "claude", "model": "m", "dry_run": False, "retries": retries,
+            "idle_wait": 0,
         })()
         report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                       asyncio.Semaphore(1)))
@@ -450,6 +451,7 @@ def test_a_session_that_plays_nothing_is_retried_and_then_gives_up(tmp_path, mon
         "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
         "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
         "model": "m", "dry_run": False, "retries": 2,
+        "idle_wait": 0,
     })()
     report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                   asyncio.Semaphore(1)))
@@ -503,6 +505,7 @@ def test_telemetry_is_banked_across_the_sessions_of_one_run(tmp_path, monkeypatc
         "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 50,
         "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
         "model": "m", "dry_run": False, "retries": 2,
+        "idle_wait": 0,
     })()
     report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                   asyncio.Semaphore(1)))
@@ -550,6 +553,7 @@ def test_a_session_that_never_reported_banks_nothing_twice(tmp_path, monkeypatch
         "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 30,
         "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
         "model": "m", "dry_run": False, "retries": 2,
+        "idle_wait": 0,
     })()
     report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                   asyncio.Semaphore(1)))
@@ -809,3 +813,110 @@ def test_only_the_arm_that_reached_for_the_answer_is_fenced():
     assert not AGENTS["claude"].FENCED, "fencing this arm rewrites a finished result"
     blank = run.Report(label="W", workspace="/w")
     assert blank.fenced is False, "a report claims a fence it was not given"
+
+
+def test_the_wait_between_idle_sessions_doubles_and_is_capped(tmp_path, monkeypatch):
+    """Ported from cc_nle, where a chain died inside a rate window: three retries in
+    three seconds are three ways of asking the same question inside it. So the wait
+    doubles, and stops doubling at an hour. A Codex plan's quota is a week-long
+    window — the same shape, sat out with a longer `--retries` rather than a new
+    mechanism."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+    waits: list[float] = []
+
+    async def no_wait(seconds):
+        waits.append(seconds)
+
+    async def nothing_at_all(where, *argv):
+        return ""
+
+    async def nothing(*a):
+        return "", 0
+
+    monkeypatch.setattr(run, "act", nothing_at_all)
+    monkeypatch.setattr(run, "one_session", nothing)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    monkeypatch.setattr(run.asyncio, "sleep", no_wait)
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+
+    def go(retries, idle_wait):
+        waits.clear()
+        args = type("A", (), {
+            "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
+            "stint": 10, "max_sessions": 20, "fresh_world": False, "agent": "claude",
+            "model": "m", "dry_run": False, "retries": retries, "idle_wait": idle_wait,
+        })()
+        report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                      asyncio.Semaphore(1)))
+        return report, list(waits)
+
+    _, waited = go(retries=4, idle_wait=60)
+    assert waited == [60, 120, 240, 480], "the wait did not double"
+    _, waited = go(retries=3, idle_wait=1800)
+    assert waited == [1800, run.MAX_IDLE_WAIT, run.MAX_IDLE_WAIT]
+
+
+def test_a_claude_run_can_be_fenced_and_says_so_before_it_ends(tmp_path, monkeypatch):
+    """The published Claude pass stays unfenced; a new Claude model with no record of
+    staying in bounds does not have to. `--fence` puts its sessions inside the same
+    fence as the Codex arm's, the report says so, and so does the arm record — which
+    is written before the first session, because a page built while a run plays has
+    no report to read and would otherwise guess from the CLI's default."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False}))
+    seen: list[list[str]] = []
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            state = json.loads((ws / "state.json").read_text())
+            state["actions_used"] += 10
+            (ws / "state.json").write_text(json.dumps(state))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        arm = json.loads((tmp_path / ".rig" / "arms" / "W.json").read_text())
+        assert arm == {"agent": "claude", "model": "claude-fable-5", "fenced": True,
+                       "effort": run.AGENTS["claude"].EFFORT}, "no record while it plays"
+        seen.append(argv)
+        return "", 0
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    monkeypatch.setattr(run, "fenced_argv", lambda agent, argv, w, h: ["FENCE", *argv])
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 500,
+        "stint": 0, "max_sessions": 3, "fresh_world": False, "agent": "claude",
+        "model": "claude-fable-5", "dry_run": False, "retries": 2, "idle_wait": 0,
+        "fence": True, "no_fence": False,
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    assert report.fenced and seen and all(argv[0] == "FENCE" for argv in seen)
+    assert seen[0][1] == "claude", "the fence wrapped something other than the CLI"
+
+
+def test_fence_and_no_fence_cannot_both_be_asked_for():
+    done = subprocess.run([sys.executable, str(ROOT / "run.py"), "--fence", "--no-fence",
+                           "--dry-run"], capture_output=True, text=True, timeout=120)
+    assert done.returncode != 0 and "not allowed with" in done.stderr

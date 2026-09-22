@@ -571,6 +571,52 @@ def agent_of(stream: Path) -> str:
     return whose(stream.read_text(errors="replace").splitlines())
 
 
+def model_of(root: Path, label: str, agent: str, report: dict | None) -> str:
+    """Which model played this workspace, from the first record that says.
+
+    Two runs of one CLI on one world are the same row on this page unless something
+    tells them apart, and what does is the model. The launcher writes it down before
+    the first session (`run.write_arm`); a run launched before that existed has only
+    its report, once the launch is over. Before that the CLI's own records do: Codex writes the model into every
+    session it keeps under the config directory the launcher gave it, and Claude
+    names it in its stream's `init` event. The adapter's default is the last resort,
+    and is only a guess about a run that was launched with `--model`.
+    """
+    arm = root / run.RIG / "arms" / f"{label}.json"
+    if arm.exists():
+        return str(json.loads(arm.read_text()).get("model") or run.AGENTS[agent].model)
+    if report and report.get("model"):
+        return str(report["model"])
+    kept = root / ".sessions" / label / run.AGENTS[agent].CONFIG_DIR / "sessions"
+    for rollout in sorted(kept.glob("*/*/*/rollout-*.jsonl")):
+        with rollout.open(errors="replace") as lines:
+            for line in lines:
+                if found := re.search(r'"model":"([^"]+)"', line):
+                    return found[1]
+    stream = root / label / "agent_stream.jsonl"
+    if stream.exists():
+        with stream.open(errors="replace") as lines:
+            for line in lines:
+                if '"subtype":"init"' in line.replace(" ", ""):
+                    try:
+                        if found := json.loads(line).get("model"):
+                            return str(found)
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    return run.AGENTS[agent].model
+
+
+def fenced_of(root: Path, label: str, agent: str, report: dict | None) -> bool:
+    """Whether this run's sessions were fenced: the launcher's record of the arm, then
+    the report, then the adapter's default — which is only right for a run launched
+    without `--fence` or `--no-fence`, and is why the record exists."""
+    arm = root / run.RIG / "arms" / f"{label}.json"
+    if arm.exists():
+        return bool(json.loads(arm.read_text()).get("fenced"))
+    return bool((report or {}).get("fenced", run.AGENTS[agent].FENCED))
+
+
 def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
                only: str = "") -> list[dict]:
     labels = json.loads((root / run.RIG / run.LABELS).read_text())
@@ -661,6 +707,14 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
             # rather than on the page, because a page can now hold more than one of
             # each and the whole point of it is telling them apart.
             "agent": agent, "launch": root.name,
+            # And which model, because a page can hold two runs of one CLI — and the
+            # name a row goes by, which is the two together with the vendor's prefix
+            # dropped: `claude opus-5`, `codex gpt-6-astra`.
+            "model": (model := model_of(root, label, agent, report)),
+            "arm": f"{agent} {model.removeprefix('claude-')}",
+            # Whether the sessions ran inside the filesystem fence — no longer a fact
+            # about the CLI alone, since a Claude run can be launched with `--fence`.
+            "fenced": fenced_of(root, label, agent, report),
             # Whether the run reached the budget it was given. A page built on a
             # timer is mostly built over an unfinished run, and a matrix that showed
             # 4,000 actions the same way it shows 30,000 would be offering a prefix
@@ -701,7 +755,7 @@ def build(roots: list[Path], out: Path, inline: bool, replay_world: bool,
         runs += one_launch(root, out, inline, replay_world, only)
     # Agent first, then world. The two arms are what this page is for, and sorting by
     # world would interleave them on the day a launch holds more than one seed.
-    runs.sort(key=lambda g: (g["agent"], g["variant"], g["seed"]))
+    runs.sort(key=lambda g: (g["agent"], g["model"], g["variant"], g["seed"]))
     people = humans() if replay_world else []
     if replay_world and not people:
         print(f"replay: no human runs under {HUMAN} — the chart will have no backdrop")

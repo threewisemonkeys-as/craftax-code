@@ -179,9 +179,9 @@ function buildMatrix() {
     const deepest = g.record.max_level > 0 ? `reached level ${g.record.max_level}` : "never left the surface";
     row.innerHTML =
       `<td class="name"><span class="dot ${mark}"></span>` +
-      /* The agent leads, because the two arms play the same world at the same seed
-         and `craftax:0` alone would name both of them identically. */
-      `${esc(g.agent)} · ${esc(g.variant)}:${esc(g.seed)}` +
+      /* The arm leads — CLI and model — because every arm plays the same world at
+         the same seed and `craftax:0` alone would name them all identically. */
+      `${esc(g.arm || g.agent)} · ${esc(g.variant)}:${esc(g.seed)}` +
       (g.done ? "" : ` <span class="chip act">playing</span>`) + `</td>` +
       `<td class="what">${esc(plural((g.record.achievements || []).length, "achievement"))}, ${esc(deepest)}</td>` +
       COLS.map(([, f]) => `<td>${esc(f(g))}</td>`).join("");
@@ -323,7 +323,7 @@ function drawChart() {
     g.stroke();
     const [ls, lv] = curve[curve.length - 1];
     g.globalAlpha = 0.65; g.fillStyle = ink("--act"); g.textAlign = "left";
-    g.fillText(other.agent, Math.min(w - pad.r - 30, x(ls) + 3), y(lv) - 2);
+    g.fillText(other.arm || other.agent, Math.min(w - pad.r - 30, x(ls) + 3), y(lv) - 2);
     g.globalAlpha = 1;
   }
 
@@ -350,7 +350,7 @@ function buildLegend() {
     ? game.curve[game.curve.length - 1][1] : 0;
   const mean = game && game.record ? (game.record.mean_episode ?? 0) - 0.9 : 0;
   el("chart-legend").innerHTML =
-    `<span><i style="background:${ink("--act")}"></i>${esc(game.agent)} — best life ` +
+    `<span><i style="background:${ink("--act")}"></i>${esc(game.arm || game.agent)} — best life ` +
     `${(100 * mine / MAX).toFixed(1)}%, mean of ` +
     `${game.record.episodes_completed ?? 0} lives ${(100 * mean / MAX).toFixed(1)}%</span>` +
     (DATA.runs.length > 1
@@ -780,12 +780,14 @@ el("footer").innerHTML = `
   ${DATA.runs.some((g) => !g.done) ? `One of these is <b>still playing</b>, and its
   row says so: everything shown for it is a prefix of a run, not a result, and the
   page is rebuilt as the world moves.` : ""}</p>
-  ${new Set(DATA.runs.map((g) => g.agent)).size > 1 ? `<p><b>The two arms were not
-  fenced alike.</b> The Codex sessions run inside a filesystem fence — the package
-  and this harness are unreadable to them — and the Claude sessions did not, because
-  that arm's finished 30,000-action pass never once reached for either and fencing it
-  afterwards would change what a published result means. Each report carries
-  <code>fenced</code>, which is where to check it rather than infer it.</p>` : ""}
+  ${new Set(DATA.runs.map((g) => g.fenced)).size > 1 ? `<p><b>The arms were not
+  fenced alike.</b> ${esc([...new Set(DATA.runs.filter((g) => g.fenced).map((g) => g.arm || g.agent))].join(", "))}
+  ran inside a filesystem fence — the package and this harness unreadable to its
+  sessions — and ${esc([...new Set(DATA.runs.filter((g) => !g.fenced).map((g) => g.arm || g.agent))].join(", "))}
+  did not. The Claude arm's finished 30,000-action pass never once reached for either,
+  and fencing it afterwards would change what a published result means; the Codex arm
+  reached in its first smoke run. Each report carries <code>fenced</code>, which is
+  where to check it rather than infer it.</p>` : ""}
   <p><b>Reasoning.</b> The CLI returns its thinking blocks encrypted, so this page
   cannot show what a session thought — only what it wrote down. That turns out to be
   most of the story: to move at all it had to state a plan, and to see anything at all
