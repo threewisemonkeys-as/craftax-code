@@ -8,7 +8,9 @@ naming `./act` at all.
 """
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,15 +21,21 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from replay import (  # noqa: E402
     BASELINES,
+    agent_of,
     assign,
     best_curve,
     attribute,
     batches,
+    build,
     keep,
     moments,
     read_log,
     thin,
+    trace,
 )
+
+import run  # noqa: E402  (replay put rig/ on the path on its way in)
+import watch_replay  # noqa: E402
 
 SEP = "=" * 80
 
@@ -427,3 +435,217 @@ def test_a_handover_is_a_boundary_and_not_an_action(tmp_path):
     # And it is not a batch: `step` is what says where a batch begins, and it has none.
     made = batches(blocks)
     assert [b["toks"] for b in made] == [["do"], ["left"]]
+
+
+# --------------------------------------------------------------------------- #
+# Watching a run that is still playing
+# --------------------------------------------------------------------------- #
+
+
+def launch(root: Path, label: str, agent: str, played: int, budget: int,
+           frames: int | None = None) -> Path:
+    """A launch directory holding everything `build` reads and nothing it does not.
+
+    `frames` is how many pictures are actually on disk, and defaults to one per
+    action plus the opening observation. Passing fewer sets up the one race a page
+    built mid-run has: a log that names a frame the actuator has not finished
+    writing.
+    """
+    from PIL import Image
+
+    ws = root / label
+    (ws / "frames").mkdir(parents=True)
+    blocks = [f"action 0 | budget 0/{budget} | start\n\n[pixels] frames/000000.png\n"]
+    blocks += [
+        f"action {n} | budget {n}/{budget} | left | step {n}/{played}\n\n"
+        f"plan: walk west\n\n[pixels] frames/{n:06d}.png\n"
+        for n in range(1, played + 1)
+    ]
+    (ws / "logs.txt").write_text("# preamble\n" + log(*blocks))
+    for n in range(played + 1 if frames is None else frames):
+        Image.new("RGB", (8, 8), (n, n, n)).save(ws / "frames" / f"{n:06d}.png")
+
+    told = f"budget {played}/{budget}"
+    stream = [{"type": "thread.started"}, {
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "./act do left",
+                 "aggregated_output": told},
+    }] if agent == "codex" else [{"type": "system"}, {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                 "input": {"command": "./act do left"}}]},
+    }, {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                 "content": told}]},
+    }]
+    (ws / "agent_stream.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in stream))
+
+    (root / run.RIG).mkdir(parents=True, exist_ok=True)
+    (root / run.RIG / run.LABELS).write_text(
+        json.dumps({label: {"variant": "craftax", "seed": 0}}))
+    env = root / ".envs" / label
+    env.mkdir(parents=True)
+    (env / run.RESULT).write_text(json.dumps({
+        "variant": "craftax", "seed": 0, "actions_used": played, "budget": budget,
+        "max_score": 226, "max_level": 0, "lives": 1, "deaths": 0,
+        "history": ["left"] * played,
+    }))
+    return root
+
+
+def page(roots, out: Path) -> dict:
+    return build(list(roots), out, inline=False, replay_world=False)
+
+
+def test_which_cli_played_a_workspace_is_read_off_its_own_stream(tmp_path):
+    """A report is written when a session *ends*, so a run watched while it plays has
+    none — and reading the agent out of it defaulted to the other CLI. The symptom was
+    silent and total: every frame and every action on the page, and not one plan,
+    command or line of output, because a Codex stream had been read for a shape it
+    does not have."""
+    root = launch(tmp_path / "L", "AAAAA", "codex", played=2, budget=10)
+    assert not (root / run.RIG / "reports").exists(), "the fixture wrote a report"
+
+    assert agent_of(root / "AAAAA" / "agent_stream.jsonl") == "codex"
+    one, = page([root], tmp_path / "p.html")["runs"]
+    assert one["agent"] == "codex"
+    assert [b["cmd"] for b in one["batches"]] == ["./act do left"], \
+        "the stream was read for the wrong CLI and came back empty"
+
+
+def test_an_absent_stream_is_not_evidence_of_either_cli(tmp_path):
+    assert agent_of(tmp_path / "nothing.jsonl") == "claude"
+
+
+def test_two_launches_are_one_matrix_with_the_arms_told_apart(tmp_path):
+    """The comparison the page exists for is one world played by two CLIs, and an arm
+    is a launch directory, so it is two of them. Both runs are `craftax:0` — the agent
+    is the only thing that names them apart, and the label is the only thing that
+    keeps their frames apart."""
+    a = launch(tmp_path / "A", "MMMMM", "codex", played=2, budget=10)
+    b = launch(tmp_path / "B", "NNNNN", "claude", played=2, budget=10)
+
+    got = page([a, b], tmp_path / "p.html")
+    assert got["launch"] == ["A", "B"]
+    # Sorted by agent, not by the order the launches were passed in.
+    assert [r["agent"] for r in got["runs"]] == ["claude", "codex"]
+    assert [r["launch"] for r in got["runs"]] == ["B", "A"]
+    assert {r["variant"] for r in got["runs"]} == {"craftax"}
+    assert {r["dir"] for r in got["runs"]} == {"p_frames/NNNNN", "p_frames/MMMMM"}
+
+
+def test_a_run_short_of_its_budget_is_not_offered_as_a_result(tmp_path):
+    """A page built on a timer is mostly built over an unfinished run. A matrix that
+    showed 2 actions the way it shows 30,000 would be offering a prefix as a result."""
+    short = launch(tmp_path / "A", "MMMMM", "codex", played=2, budget=10)
+    whole = launch(tmp_path / "B", "NNNNN", "codex", played=10, budget=10)
+    assert page([short], tmp_path / "p.html")["runs"][0]["done"] is False
+    assert page([whole], tmp_path / "q.html")["runs"][0]["done"] is True
+
+
+def test_a_frame_is_encoded_once_and_then_kept(tmp_path):
+    """The thing that makes a page rebuildable on a timer. At 45 ms a frame, doing all
+    thirty thousand again is twenty-three minutes and doing the two hundred that
+    arrived since the last build is ten seconds."""
+    root = launch(tmp_path / "L", "AAAAA", "claude", played=3, budget=10)
+    out = tmp_path / "p.html"
+    page([root], out)
+    where = out.parent / "p_frames" / "AAAAA"
+    was = {f.name: f.stat().st_mtime_ns for f in where.iterdir()}
+    assert len(was) == 4, "one per action plus the opening observation"
+
+    page([root], out)
+    assert {f.name: f.stat().st_mtime_ns for f in where.iterdir()} == was
+    assert not list(where.glob("*.part")), "a temporary file was left behind"
+
+
+def test_a_world_dealt_again_under_the_same_label_is_encoded_again(tmp_path):
+    """`--replay` deals a new world into the same workspace under the same label, and
+    writes its frames over the old world's, name for name. Keeping a picture because
+    a file of that name exists would show the old run forever."""
+    root = launch(tmp_path / "L", "AAAAA", "claude", played=2, budget=10)
+    out = tmp_path / "p.html"
+    page([root], out)
+    kept = out.parent / "p_frames" / "AAAAA" / "000001.webp"
+    was = kept.read_bytes()
+
+    from PIL import Image
+    fresh = root / "AAAAA" / "frames" / "000001.png"
+    Image.new("RGB", (8, 8), (200, 30, 30)).save(fresh)
+    os.utime(fresh, (time.time() + 10, time.time() + 10))
+
+    page([root], out)
+    assert kept.read_bytes() != was, "the new world is showing the old world's frame"
+
+
+def test_a_frame_the_log_names_before_the_disk_has_it_waits_for_the_next_build(tmp_path):
+    """The log names a frame in the same breath as the actuator writes it, so a page
+    built while the world is moving can be one picture ahead of the disk. Everything
+    after this point assumes a frame it can open."""
+    root = launch(tmp_path / "L", "AAAAA", "codex", played=3, budget=10, frames=3)
+    one, = page([root], tmp_path / "p.html")["runs"]
+    assert [f["n"] for f in one["frames"]] == [0, 1, 2]
+
+
+def test_the_world_replay_is_cached_against_the_history_it_came_from(tmp_path,
+                                                                     monkeypatch):
+    """Three minutes for thirty thousand actions, and a page rebuilt every half hour
+    would spend it on a *finished* arm every time it caught the live one up. The key
+    is the length of the history rather than an mtime, because a history is only ever
+    appended to."""
+    import readout
+
+    asked = []
+
+    def counted(record):
+        asked.append(len(record["history"]))
+        return [{"action": i + 1} for i in range(len(record["history"]))]
+
+    monkeypatch.setattr(readout, "replay", counted)
+    root = tmp_path / "L"
+    (root / run.RIG).mkdir(parents=True)
+    record = {"history": ["left", "right"]}
+
+    assert trace(record, root, "AAAAA") == [{"action": 1}, {"action": 2}]
+    assert trace(record, root, "AAAAA") == [{"action": 1}, {"action": 2}]
+    assert asked == [2], "a finished arm was replayed a second time"
+
+    record["history"].append("up")
+    assert len(trace(record, root, "AAAAA")) == 3
+    assert asked == [2, 3], "a run that grew was served the trace it had before"
+
+
+def test_the_watch_stops_on_the_record_and_not_on_a_process(tmp_path):
+    """Not the launcher's pid — a run outlives its launch and this one is continued
+    more than once before it reaches its budget — and not `pgrep -f`, whose pattern
+    matches the shell that greps for it. The record is what says a run is over."""
+    root = launch(tmp_path / "L", "AAAAA", "codex", played=9, budget=10)
+    assert not watch_replay.finished([root])
+
+    result = root / ".envs" / "AAAAA" / run.RESULT
+    result.write_text(json.dumps(json.loads(result.read_text()) | {"actions_used": 10}))
+    assert watch_replay.finished([root])
+
+
+def test_a_launch_that_has_not_played_yet_is_not_a_launch_that_is_over(tmp_path):
+    """The watcher can be started before the run it watches. Reading the absence of a
+    record as a finished run would stop the watch before the run began."""
+    bare = tmp_path / "M"
+    (bare / run.RIG).mkdir(parents=True)
+    (bare / run.RIG / run.LABELS).write_text(
+        json.dumps({"CCCCC": {"variant": "craftax", "seed": 0}}))
+    assert not watch_replay.finished([bare])
+
+
+def test_a_scan_that_found_nothing_new_looks_the_same_as_the_one_before(tmp_path):
+    """What keeps an idle cycle free: a build costs whatever arrived since the last
+    one, and overnight nothing does."""
+    root = launch(tmp_path / "L", "AAAAA", "codex", played=2, budget=10)
+    was = watch_replay.fingerprint([root])
+    assert watch_replay.fingerprint([root]) == was
+
+    (root / "AAAAA" / "logs.txt").write_text(
+        (root / "AAAAA" / "logs.txt").read_text() + "more\n")
+    assert watch_replay.fingerprint([root]) != was

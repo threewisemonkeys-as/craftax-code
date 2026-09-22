@@ -165,19 +165,27 @@ function buildMatrix() {
   t.innerHTML = "<tr><th>Run</th><th>What it reached</th>" +
     COLS.map(([h]) => `<th>${h}</th>`).join("") + "</tr>";
   for (const g of DATA.runs) {
-    const audit = g.report.audit || { findings: {} };
-    const dirty = Object.keys(audit.findings || {}).length > 0;
+    /* Three states and not two. A session is audited when it ends, so a page built
+       while a run is still playing has no verdict on it yet — and a green dot would
+       be claiming one it does not have. */
+    const audit = g.report.audit;
+    const dirty = !!audit && Object.keys(audit.findings || {}).length > 0;
+    const mark = !audit ? "zero" : dirty ? "critical" : "good";
+    const verdict = !audit ? "not audited yet" : dirty ? "AUDIT FLAGGED" : "audit clean";
     const row = document.createElement("tr");
     row.className = "game-row";
     row.dataset.label = g.label;
     row.tabIndex = 0;
     const deepest = g.record.max_level > 0 ? `reached level ${g.record.max_level}` : "never left the surface";
     row.innerHTML =
-      `<td class="name"><span class="dot ${dirty ? "critical" : "good"}"></span>` +
-      `${esc(g.variant)}:${esc(g.seed)}</td>` +
+      `<td class="name"><span class="dot ${mark}"></span>` +
+      /* The agent leads, because the two arms play the same world at the same seed
+         and `craftax:0` alone would name both of them identically. */
+      `${esc(g.agent)} · ${esc(g.variant)}:${esc(g.seed)}` +
+      (g.done ? "" : ` <span class="chip act">playing</span>`) + `</td>` +
       `<td class="what">${esc(plural((g.record.achievements || []).length, "achievement"))}, ${esc(deepest)}</td>` +
       COLS.map(([, f]) => `<td>${esc(f(g))}</td>`).join("");
-    row.title = `workspace ${g.label}` + (dirty ? " · AUDIT FLAGGED" : " · audit clean");
+    row.title = `workspace ${g.label} · launch ${g.launch} · ${verdict}`;
     const go = () => load(g.label);
     row.addEventListener("click", go);
     row.addEventListener("keydown", (e) => {
@@ -250,7 +258,10 @@ function drawChart() {
   const { g, w, h, pad } = chartBox();
   const runs = DATA.humans || [];
   const mine = game ? game.curve || [] : [];
-  const top = Math.max(3000, ...runs.map((r) => r.steps), mine.length ? mine[mine.length - 1][0] : 0);
+  /* Over every run on the page and not just the one being shown, so that switching
+     arms does not rescale the axis under the comparison. */
+  const ends = DATA.runs.map((r) => (r.curve || []).length ? r.curve[r.curve.length - 1][0] : 0);
+  const top = Math.max(3000, ...runs.map((r) => r.steps), ...ends);
   const x = (step) => pad.l + (Math.log10(Math.max(1, step)) / Math.log10(top)) * (w - pad.l - pad.r);
   const y = (score) => h - pad.b - (score / MAX) * (h - pad.t - pad.b);
   g.clearRect(0, 0, w, h);
@@ -299,6 +310,23 @@ function drawChart() {
     g.fillText(r.name, Math.min(w - pad.r - 26, x(ls) + 3), y(lv) - 2);
   });
 
+  /* The other arms, dimmed and named by the CLI that played them. The comparison
+     this page exists for is between two of these lines, and asking someone to hold
+     one in their head while they click to the other is not showing it to them. */
+  for (const other of DATA.runs) {
+    const curve = (game && other.label === game.label) ? [] : (other.curve || []);
+    if (!curve.length) continue;
+    g.strokeStyle = ink("--act"); g.lineWidth = 1.6; g.globalAlpha = 0.3;
+    g.beginPath();
+    curve.forEach(([step, score], i) =>
+      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
+    g.stroke();
+    const [ls, lv] = curve[curve.length - 1];
+    g.globalAlpha = 0.65; g.fillStyle = ink("--act"); g.textAlign = "left";
+    g.fillText(other.agent, Math.min(w - pad.r - 30, x(ls) + 3), y(lv) - 2);
+    g.globalAlpha = 1;
+  }
+
   /* This run, in the accent. */
   if (mine.length) {
     g.strokeStyle = ink("--act"); g.lineWidth = 2.4;
@@ -322,9 +350,12 @@ function buildLegend() {
     ? game.curve[game.curve.length - 1][1] : 0;
   const mean = game && game.record ? (game.record.mean_episode ?? 0) - 0.9 : 0;
   el("chart-legend").innerHTML =
-    `<span><i style="background:${ink("--act")}"></i>this run — best life ` +
+    `<span><i style="background:${ink("--act")}"></i>${esc(game.agent)} — best life ` +
     `${(100 * mine / MAX).toFixed(1)}%, mean of ` +
     `${game.record.episodes_completed ?? 0} lives ${(100 * mean / MAX).toFixed(1)}%</span>` +
+    (DATA.runs.length > 1
+      ? `<span><i style="background:${ink("--act")};opacity:.3"></i>the other ` +
+        `${plural(DATA.runs.length - 1, "arm")} on this page, same axes</span>` : "") +
     `<span><i class="human"></i>${plural((DATA.humans || []).length, "human run")}` +
     ` from the paper's own dataset</span>` +
     `<span><i class="dash"></i>published RL, after a billion training steps</span>`;
@@ -740,10 +771,21 @@ document.addEventListener("keydown", (e) => {
 });
 
 el("footer").innerHTML = `
-  <p><b>What is on this page.</b> Launch ${esc(DATA.launch)}: ${plural(DATA.runs.length, "session")},
+  <p><b>What is on this page.</b> ${DATA.launch.length > 1
+    ? `${plural(DATA.launch.length, "launch")} — ${DATA.launch.map(esc).join(", ")}`
+    : `Launch ${esc(DATA.launch[0])}`}: ${plural(DATA.runs.length, "run")},
   each given the same brief and the game's own 43 actions by their real names. The
   observation is the 64-pixel render and nothing else — no state, no positions, no
-  achievement notices. Every frame here is one the session was given.</p>
+  achievement notices. Every frame here is one the session was given.
+  ${DATA.runs.some((g) => !g.done) ? `One of these is <b>still playing</b>, and its
+  row says so: everything shown for it is a prefix of a run, not a result, and the
+  page is rebuilt as the world moves.` : ""}</p>
+  ${new Set(DATA.runs.map((g) => g.agent)).size > 1 ? `<p><b>The two arms were not
+  fenced alike.</b> The Codex sessions run inside a filesystem fence — the package
+  and this harness are unreadable to them — and the Claude sessions did not, because
+  that arm's finished 30,000-action pass never once reached for either and fencing it
+  afterwards would change what a published result means. Each report carries
+  <code>fenced</code>, which is where to check it rather than infer it.</p>` : ""}
   <p><b>Reasoning.</b> The CLI returns its thinking blocks encrypted, so this page
   cannot show what a session thought — only what it wrote down. That turns out to be
   most of the story: to move at all it had to state a plan, and to see anything at all

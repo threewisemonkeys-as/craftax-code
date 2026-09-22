@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """What each session saw, what it played, and what it did between the two.
 
-    .env-venv/bin/python tools/replay.py ~/craftax-runs/20260909-053629 --out replay.html
+    .env-venv/bin/python tools/replay.py ~/craftax-runs/20260909-053629 \
+        ~/craftax-runs/20260922-144509 --out replay.html
 
 Adapted from cc_humanrl's tools/replay.py. The shape is the same — pick a run, scrub
 the trajectory, and at every action the page holds the plan that batch was given, the
@@ -32,8 +33,23 @@ So there are two modes, and the default is the honest one:
 action, so nothing on disk says what the score was at action 700. `tools/readout.py`
 replays the recorded history through a fresh engine, which is bit-exact in seed and
 actions, and that gives the achievement timeline, the level, and the health/food/drink
-the session was carrying. It costs a minute of JAX and is worth it; `--no-replay` skips
-it and the page loses those tracks.
+the session was carrying. It costs three minutes of JAX for thirty thousand actions
+and is worth it; `--no-replay` skips it and the page loses those tracks.
+
+**Several launches, one page.** An arm is a launch directory, and the comparison this
+page exists for — one world, two CLIs — is two of them, so `launch` takes as many as
+you have. Nothing has to be disambiguated: a label is drawn per launch from a space
+big enough that two arms do not collide, and it is what keys the reports, the frame
+directories and the matrix alike.
+
+**A run that is still playing** can be read the whole time, and the page says which
+rows are still moving rather than showing a prefix as if it were a result. Two things
+make rebuilding cheap enough to do on a timer — which is what `tools/watch_replay.py`
+does: a frame is written once and never edited, so only the ones that arrived since
+the last build are encoded (all thirty thousand is twenty-three minutes; the two
+hundred since the last build is ten seconds), and the world replay is cached against
+the length of the history it was computed from, so a finished arm is replayed once
+and never again.
 
 **Reasoning.** The CLI returns thinking blocks with their content encrypted — all 453
 in this launch are an empty string beside a signature, against 303,101 thinking tokens
@@ -50,7 +66,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -351,16 +366,36 @@ def attribute(said: list[dict]) -> tuple[dict[str, int], dict[str, int]]:
 # --------------------------------------------------------------------------- #
 # The world, replayed: what the score was at every action
 # --------------------------------------------------------------------------- #
-def trace(record: dict) -> list[dict]:
+def trace(record: dict, root: Path, label: str) -> list[dict]:
     """The per-action score, level and condition, from `tools/readout.py`.
 
     Nothing on disk holds this: `result.json` is rewritten in place after every action.
     A world is bit-exact in its seed and its actions, so playing the recorded history
     again recovers it.
+
+    Cached beside the run, because it costs three minutes for thirty thousand actions
+    and a page rebuilt on a timer would otherwise spend that on a *finished* arm every
+    time it caught the live one up. The key is how long the history was rather than
+    when the file changed: a history is only ever appended to, so a cache taken at the
+    same length is the same trajectory — and the one thing that makes a history
+    shorter, `--replay` dealing the world again, misses the key and is recomputed.
     """
     from readout import replay  # noqa: PLC0415
 
-    return replay(record)
+    played = len(record["history"])
+    cache = root / run.RIG / "traces" / f"{label}.json"
+    try:
+        was = json.loads(cache.read_text())
+        if was["played"] == played:
+            return was["rows"]
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass  # unreadable is the same as absent — replay it and write it again
+    rows = replay(record)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    part = cache.with_suffix(".part")
+    part.write_text(json.dumps({"played": played, "rows": rows}, separators=(",", ":")))
+    part.rename(cache)
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -456,8 +491,7 @@ def keep(frames: list[dict], budget: int, sample: int) -> list[int]:
     return sorted(must | thinned)
 
 
-def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool,
-             keep_frames: bool = False) -> dict:
+def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool) -> dict:
     """Write the frames, and say where they went.
 
     Returns what the page needs: the size to draw at, and either a directory to load
@@ -473,18 +507,32 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool,
 
     if not inline:
         where = out.parent / f"{out.stem}_frames" / label
-        # Editing the page should not cost four minutes of re-encoding frames that
-        # did not change. The count is the check: a run's frames are written once and
-        # never edited, so a complete directory is a correct one.
-        if keep_frames and where.is_dir() and len(list(where.glob("*.webp"))) == len(names):
-            print(f"replay: keeping the {len(names)} frames already under {where}")
-            return {"w": w, "h": h, "dir": f"{out.stem}_frames/{label}",
-                    "shown": list(range(len(frames))), "bytes": 0}
-        if where.exists():
-            shutil.rmtree(where)
-        where.mkdir(parents=True)
+        where.mkdir(parents=True, exist_ok=True)
+        # Only what is not already there, which is what lets a page be rebuilt while
+        # the run is still playing: at 45 ms a frame, all thirty thousand is
+        # twenty-three minutes and the two hundred that arrived since the last build
+        # is ten seconds.
+        #
+        # The test is the source's own mtime rather than the file merely existing,
+        # because a label outlives the world it named: `--replay` deals a new world
+        # into the same workspace under the same label, and every frame of it is
+        # written over a frame of the old one. Newer source, re-encode — so the one
+        # case where the pictures on disk are a lie about the run is also the one
+        # case this notices.
+        made = 0
         for name in names:
-            (where / (Path(name).stem + ".webp")).write_bytes(shrink(ws / name))
+            target = where / (Path(name).stem + ".webp")
+            source = ws / name
+            if target.exists() and target.stat().st_mtime >= source.stat().st_mtime:
+                continue
+            # Under a temporary name and renamed, because a build killed part-way
+            # through an encode would otherwise leave a half-frame that the next
+            # build, finding it present and newer, would keep forever.
+            part = target.with_suffix(".part")
+            part.write_bytes(shrink(source))
+            part.rename(target)
+            made += 1
+        print(f"replay: {label} encoded {made} new frames, {len(names)} on the page")
         return {"w": w, "h": h, "dir": f"{out.stem}_frames/{label}",
                 "shown": list(range(len(frames))), "bytes": 0}
 
@@ -506,11 +554,31 @@ def pictures(ws: Path, frames: list[dict], out: Path, label: str, inline: bool,
 # --------------------------------------------------------------------------- #
 # Building the page
 # --------------------------------------------------------------------------- #
-def build(root: Path, out: Path, inline: bool, replay_world: bool,
-          only: str = "", keep_frames: bool = False) -> dict:
+def agent_of(stream: Path) -> str:
+    """Which CLI played this workspace, read off its own stream.
+
+    Not from the report, which is where this used to come from, because a report is
+    written when a session *ends* — so a run being watched while it plays has none
+    until the first stint hands over, and the default was the other CLI. The symptom
+    was silent and total: a live Codex run built a page with every frame and every
+    action on it and not one plan, command or line of output, because every event in
+    its stream had been read for a shape it does not have.
+    """
+    if not stream.exists():
+        return "claude"
+    from readout import whose  # noqa: PLC0415
+
+    return whose(stream.read_text(errors="replace").splitlines())
+
+
+def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
+               only: str = "") -> list[dict]:
     labels = json.loads((root / run.RIG / run.LABELS).read_text())
     if only:
-        labels = {only: labels[only]}
+        # Empty rather than a KeyError: with several launches on the page, a label
+        # names a workspace in exactly one of them and the others have nothing to
+        # contribute. `main` has already checked that some launch knows it.
+        labels = {only: labels[only]} if only in labels else {}
     reports = {
         path.stem: json.loads(path.read_text())
         for path in sorted((root / run.RIG / "reports").glob("*.json"))
@@ -526,13 +594,13 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
         if not blocks:
             print(f"replay: {label} logged no actions — skipped")
             continue
-        said = moments(ws / "agent_stream.jsonl",
-                       (report or {}).get("agent", "claude"), ws)
+        agent = agent_of(ws / "agent_stream.jsonl")
+        said = moments(ws / "agent_stream.jsonl", agent, ws)
         made = batches(blocks)
         assign(made, said)
 
         record = json.loads((root / ".envs" / label / "result.json").read_text())
-        rows = trace(record) if replay_world else []
+        rows = trace(record, root, label) if replay_world else []
         by_action = {r["action"]: r for r in rows}
 
         # Every frame the log names, in order. Longer than the action count: the block
@@ -566,6 +634,16 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
                     "hp": row.get("health", 0), "food": row.get("food", 0),
                     "drink": row.get("drink", 0), "energy": row.get("energy", 0),
                 })
+        # A page built while the world is being played can be one picture ahead of
+        # the disk: the log names a frame in the same breath as the actuator writes
+        # it. Dropped from the end rather than tolerated, because everything after
+        # this — the transport, the batch index, the encoder — assumes a frame it can
+        # open, and the next build will have it.
+        while frames and not (ws / frames[-1]["name"]).exists():
+            frames.pop()
+        if not frames:
+            print(f"replay: {label} has actions logged but no frames yet — skipped")
+            continue
         for i, frame in enumerate(frames):
             frame["b"] = next(
                 (j for j, b in enumerate(made) if b["from"] < frame["n"] <= b["to"]), -1
@@ -576,9 +654,19 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
         # The same quantity as the human backdrop, from the same definition.
         curve = thin(best_curve([r["reward"] for r in rows],
                                 [not r["alive"] for r in rows])) if rows else []
-        art = pictures(ws, frames, out, label, inline, keep_frames)
+        art = pictures(ws, frames, out, label, inline)
         runs.append({
             "label": label, "variant": meta["variant"], "seed": meta.get("seed", 0),
+            # Which CLI, and which launch it was played out of. Both are on the run
+            # rather than on the page, because a page can now hold more than one of
+            # each and the whole point of it is telling them apart.
+            "agent": agent, "launch": root.name,
+            # Whether the run reached the budget it was given. A page built on a
+            # timer is mostly built over an unfinished run, and a matrix that showed
+            # 4,000 actions the same way it shows 30,000 would be offering a prefix
+            # as a result.
+            "done": int(record.get("actions_used") or 0)
+            >= int(record.get("budget") or 0),
             "report": report or {}, "record": {
                 k: record.get(k) for k in (
                     "actions_used", "budget", "score", "score_pct", "best_episode",
@@ -603,19 +691,31 @@ def build(root: Path, out: Path, inline: bool, replay_world: bool,
             "files": sorted(p.name for p in ws.glob("*.py")),
             **art,
         })
-    runs.sort(key=lambda g: (g["variant"], g["seed"]))
+    return runs
+
+
+def build(roots: list[Path], out: Path, inline: bool, replay_world: bool,
+          only: str = "") -> dict:
+    runs: list[dict] = []
+    for root in roots:
+        runs += one_launch(root, out, inline, replay_world, only)
+    # Agent first, then world. The two arms are what this page is for, and sorting by
+    # world would interleave them on the day a launch holds more than one seed.
+    runs.sort(key=lambda g: (g["agent"], g["variant"], g["seed"]))
     people = humans() if replay_world else []
     if replay_world and not people:
         print(f"replay: no human runs under {HUMAN} — the chart will have no backdrop")
     return {
-        "launch": root.name, "inline": inline, "replayed": replay_world,
-        "runs": runs, "humans": people, "baselines": BASELINES,
+        "launch": [root.name for root in roots], "inline": inline,
+        "replayed": replay_world, "runs": runs, "humans": people,
+        "baselines": BASELINES,
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("launch", help="a launch directory under ~/craftax-runs")
+    parser.add_argument("launch", nargs="+",
+                        help="one or more launch directories under ~/craftax-runs")
     parser.add_argument("--out", default="replay.html")
     parser.add_argument("--label", help="one workspace (default: all of them)")
     parser.add_argument(
@@ -623,28 +723,27 @@ def main() -> int:
         help="one self-contained file; thins runs of plain movement to fit",
     )
     parser.add_argument(
-        "--keep-frames", action="store_true",
-        help="reuse the frames already written, for when only the page changed",
-    )
-    parser.add_argument(
         "--no-replay", action="store_true",
         help="skip the world replay, and with it the score and condition tracks",
     )
     args = parser.parse_args()
 
-    root = Path(args.launch).expanduser().resolve()
+    roots = [Path(one).expanduser().resolve() for one in args.launch]
     out = Path(args.out).expanduser().resolve()
     if args.label:
-        known = json.loads((root / run.RIG / run.LABELS).read_text())
+        known = {
+            label: root.name
+            for root in roots
+            for label in json.loads((root / run.RIG / run.LABELS).read_text())
+        }
         if args.label not in known:
             raise SystemExit(
-                f"replay: {args.label} is not a workspace of this launch — "
+                f"replay: {args.label} is not a workspace of any of these launches — "
                 f"try one of {', '.join(sorted(known))}"
             )
-    # Filtered before building rather than after: building a run means writing three
-    # thousand frames, and a matrix launch holds one per seed.
-    bundle = build(root, out, args.inline, not args.no_replay, args.label or "",
-                   args.keep_frames)
+    # Filtered before building rather than after: building a run means encoding every
+    # frame of it, and a launch holds one run per seed.
+    bundle = build(roots, out, args.inline, not args.no_replay, args.label or "")
     if not bundle["runs"]:
         raise SystemExit("replay: nothing to show")
 
@@ -661,10 +760,14 @@ def main() -> int:
     for one in bundle["runs"]:
         shown, total = len(one["shown"]), len(one["frames"])
         print(
-            f"{one['label']}  {one['variant']}:{one['seed']}  {total:>5} frames"
+            f"{one['label']}  {one['agent']:<7} {one['variant']}:{one['seed']}"
+            f"  {total:>5} frames"
             + (f" ({shown} inlined)" if args.inline else "")
             + f"  {len(one['batches']):>4} batches"
             f"  {sum(len(b['work']) for b in one['batches']):>5} moments off the board"
+            + ("" if one["done"] else
+               f"  · still playing, {one['record']['actions_used']}"
+               f"/{one['record']['budget']}")
         )
     print(f"\nwrote {out} ({size:.1f} MB)")
     if args.inline:
