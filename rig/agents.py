@@ -71,6 +71,11 @@ class Agent(Protocol):
     CONFIG_ENV: str
     CONFIG_DIR: str
     CREDENTIAL: str
+    # Whether a session of this CLI is run inside the launcher's filesystem fence.
+    # An adapter's own answer rather than a run's, because it is a fact about how
+    # this CLI behaves when it is left alone with a disk — see `Codex` below, and
+    # `fenced_argv` in run.py for what the fence grants and why the two arms differ.
+    FENCED: bool
 
     def argv(self, task: str, model: str, ws: Path) -> list[str]: ...
     def absorb(self, report: Any, event: dict) -> None: ...
@@ -90,6 +95,11 @@ class Claude:
     CONFIG_ENV = "CLAUDE_CONFIG_DIR"
     CONFIG_DIR = ".claude"
     CREDENTIAL = ".credentials.json"
+    # Unfenced, and the published 30k pass is why. Thirteen sessions had the whole
+    # disk and the audit came back empty: this CLI did not once reach for the
+    # package or for this harness. Fencing it now would change what a finished
+    # result means rather than protect an unfinished one.
+    FENCED = False
     # The agent acts through ./act and reasons with a shell and files, so these
     # are pre-approved for an unattended session.
     #
@@ -296,11 +306,12 @@ class Codex:
     not stop when that happens. Asked to write a file and read it back, it reported
     the contents it expected; no file existed. A session of this harness would play
     no actions, score zero, and look from the launcher exactly like one that read the
-    workspace and gave up. So the sandbox is off, which is also what the Claude arm
-    runs with: neither CLI is fenced by the OS here, and the audit and the
-    interpreter split are what stand there. `no_commands` below is the residual
-    check, because a shell that cannot start is worth telling apart from a session
-    that chose not to use one.
+    workspace and gave up. So the CLI's own sandbox is off, as it is on the Claude
+    arm — and what stands in its place is where the two arms part: see `FENCED`
+    below, which is this adapter's answer to what a session of it does when it is
+    left alone with a disk. `no_commands` below is the residual check, because a
+    shell that cannot start is worth telling apart from a session that chose not to
+    use one.
 
     **Its tool surface is a configuration, not a flag.** There is no denylist to
     pass. What a session can reach is decided by features that ship on, a browser and
@@ -322,6 +333,13 @@ class Codex:
     CONFIG_ENV = "CODEX_HOME"
     CONFIG_DIR = ".codex"
     CREDENTIAL = "auth.json"
+    # Fenced, and a smoke run is why. Given thirty actions it played eight and spent
+    # the rest reading: `tools/route.py`, which is a scripted player that walks the
+    # early tech tree, then the package's own constants. The audit caught it, which
+    # is the audit working — but a finding at the end of a fifteen-hour run is a
+    # score that measured reading. So this arm runs inside `fenced_argv`, and
+    # `Report.fenced` records that it did.
+    FENCED = True
     # The transcript the JSON stream leaves out, under CONFIG_ENV. Versioned by the
     # CLI: a newer one would land beside this rather than replace it, which `harvest`
     # reports rather than silently reading nothing.

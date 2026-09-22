@@ -39,6 +39,7 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
 import sys
 import time
 from datetime import UTC, datetime
@@ -65,6 +66,10 @@ RUNS = Path(os.environ.get("CRAFTAX_RUNS") or Path.home() / "craftax-runs")
 # The interpreter the workspace's `python` shim points at: numpy and Pillow, and
 # deliberately not the package. Built by tools/make_agent_venv.sh.
 AGENT_PYTHON = REPO / ".agent-venv" / "bin" / "python"
+# The filesystem fence, applied to a session's own process before its CLI starts.
+# See `fenced_argv` below and rig/fence.py for what it is and why only one arm has
+# one.
+FENCE = REPO / "rig" / "fence.py"
 
 # No I, O, 0 or 1: a label is read off a directory listing and typed back by hand.
 LABEL_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -148,6 +153,10 @@ class Report(BaseModel):
     # it is kept off the report: an adapter needs somewhere to remember this, and it
     # cannot be the adapter, which is one object shared by every world in a launch.
     last_message: str | None = Field(default=None, exclude=True)
+    # Whether the sessions ran inside the filesystem fence — see `fenced_argv`. Only
+    # one arm has one, so this is the field that keeps the two arms' scores from
+    # being read as if they were measured the same way.
+    fenced: bool = False
     # How many agent sessions played this run. More than one means it was stinted:
     # every counter above is the sum over all of them, and every score below is the
     # run's, because the run is the thing they were all playing.
@@ -347,6 +356,84 @@ def session_config(root: Path, label: str, agent=None) -> Path:
     link.unlink(missing_ok=True)
     link.symlink_to(credential)
     return config
+
+
+def site_packages(venv: Path) -> Path:
+    """Where a virtual environment keeps what was installed into it."""
+    for found in sorted(venv.glob("lib/python*/site-packages")):
+        return found
+    raise SystemExit(f"run: {venv} has no site-packages — is it built?")
+
+
+def fenced_argv(agent, argv: list[str], ws: Path, home: Path) -> list[str]:
+    """`argv`, wrapped in the only filesystem the session will be able to see.
+
+    The fence itself is rig/fence.py; this is the allowlist, and the allowlist is
+    the whole design. What it exists to close is a single reach: the package's
+    source carries every achievement by name and this harness carries a scripted
+    player that walks the tech tree, so a session that greps either one is reading
+    the answer instead of playing. That is not hypothetical — see the module
+    docstring in rig/fence.py for the session that did it.
+
+    Only the Codex arm is fenced, which is an asymmetry and is recorded as one:
+    `Report.fenced` says which side of it a run was on. The Claude arm's published
+    30k pass had the same reach and never used it, so fencing it now would change a
+    result rather than protect one; fencing this arm makes its score a claim about
+    playing rather than about reading. Both are disclosed; neither is inferred from
+    the other.
+
+    Three kinds of grant, and the difference between them matters:
+
+    * **read** — the system, the two interpreters, the CLI's own binary, and the
+      credential, which is granted by name because the copy in `home` is a symlink
+      to it and Landlock checks where a symlink lands.
+    * **write** — the workspace, this session's config directory, and the temporary
+      directories every CLI assumes.
+    * **list** — the harness's own directory and the interpreter's `site-packages`,
+      whose *names* are readable and whose contents are not. Python lists the
+      directory a script sits in to find the module beside it, so `./act` cannot run
+      without this; with it, everything in this repository except the two files
+      `./act` is made of stays shut, `tools/route.py` among them.
+
+    The package is closed by never being named: rules only ever widen a hierarchy,
+    so `site-packages` is passed as its contents minus the one entry that is the
+    answer key.
+    """
+    binary = shutil.which(argv[0])
+    if not binary:
+        raise SystemExit(f"run: {argv[0]} is not on PATH — there is nothing to fence")
+    # Not the binary's directory but the release it was installed as: this CLI ships
+    # tools of its own — `rg` among them — in a sibling of its `bin`, and a session
+    # that loses them has lost a capability the unfenced arm keeps. The fence is
+    # meant to take away the answer, not the tools.
+    shipped = Path(binary).resolve().parent
+    shipped = shipped.parent if shipped.name == "bin" else shipped
+    site = site_packages(REPO / ".env-venv")
+    credential = Path.home() / agent.CONFIG_DIR / agent.CREDENTIAL
+    read = [
+        Path("/usr"),
+        Path("/etc"),
+        Path("/proc"),
+        Path("/sys"),
+        # /etc/resolv.conf is a symlink into here on this machine, and a session
+        # that cannot resolve a name cannot reach its own API.
+        Path("/run/systemd/resolve"),
+        Path(sys.base_prefix),  # the real interpreter behind both venvs, and its stdlib
+        shipped,  # the CLI's own binary and the tools it ships beside it
+        REPO / "act.py",  # the two files the workspace's `act` shim runs
+        REPO / "craftax_game.py",
+        REPO / ".env-venv" / "bin",
+        REPO / ".env-venv" / "pyvenv.cfg",
+        AGENT_PYTHON.parents[1],  # the agent's own interpreter, which has no package
+        *(p for p in site.iterdir() if not p.name.startswith("craftax")),
+        *([credential] if credential.exists() else []),
+    ]
+    write = [ws, home, Path("/tmp"), Path("/var/tmp"), Path("/dev")]
+    listed = [REPO, site]
+    flags: list[str] = []
+    for flag, paths in (("--ro", read), ("--rw", write), ("--ls", listed)):
+        flags += [arg for path in paths for arg in (flag, str(path))]
+    return [sys.executable, str(FENCE), *flags, "--", *argv]
 
 
 async def act(ws: Path, *args: str) -> str:
@@ -587,12 +674,13 @@ async def play(
         # into the report as they read the stream: they have to be counting from the
         # run's total, not from this launch's zero.
         was = carried(root, label, opening == "resume")
+        agent = AGENTS[args.agent]
         report = Report(label=label, variant=variant, seed=seed, obs=channels,
                         workspace=str(ws), agent=args.agent, model=args.model,
                         budget=budget, turns=int(was["turns"]),
                         tool_calls=int(was["tool_calls"]),
+                        fenced=agent.FENCED and not args.no_fence,
                         compactions=int(was["compactions"]))
-        agent = AGENTS[args.agent]
 
         def briefed(n: int) -> str:
             """What session `n` is told it is walking into.
@@ -662,6 +750,10 @@ async def play(
                 # many hours (F13).
                 home = session_config(root, label, agent)
                 session_env = env | {agent.CONFIG_ENV: str(home)}
+                # After the config directory exists, because the fence has to grant
+                # it: a session cannot be given a home it may not write to.
+                if report.fenced:
+                    argv = fenced_argv(agent, argv, ws, home)
                 stderr, report.exit_code = await one_session(
                     argv, ws, session_env, report, agent)
                 # Before anything reads the stream, and inside the loop rather than
@@ -948,6 +1040,11 @@ async def main() -> int:
     parser.add_argument("--fresh-world", action="store_true",
                         help="deal a new world on each life instead of replaying this one")
     parser.add_argument("--agent", default="claude", choices=sorted(AGENTS))
+    parser.add_argument(
+        "--no-fence", action="store_true",
+        help="run an agent that is normally fenced with the whole disk instead. "
+             "For finding out what a session reaches for; not for a measured run",
+    )
     parser.add_argument("--model", help="model for the agent sessions (default: the agent's own)")
     parser.add_argument("-c", "--concurrency", type=int, default=4, help="worlds at once")
     parser.add_argument(
@@ -1004,6 +1101,16 @@ async def main() -> int:
                   f"inherit a copy and refresh their own; the cost column is computed "
                   f"from this model's published prices, not reported by the CLI.",
                   flush=True)
+        # Said out loud because it is the asymmetry between the two arms, and a run
+        # whose log does not mention it is a run somebody will later compare to the
+        # Claude pass without knowing.
+        if agent.FENCED and not args.no_fence:
+            print("run: sessions are fenced to their workspace — the package and "
+                  "this harness are unreadable to them. The Claude arm is not "
+                  "fenced; see fenced_argv.", flush=True)
+        else:
+            print("run: --no-fence — sessions can read the package and this "
+                  "harness, which the audit will record as a finding.", flush=True)
 
     if args.replay and args.carry_on:
         raise SystemExit(

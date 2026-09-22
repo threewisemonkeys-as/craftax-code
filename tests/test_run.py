@@ -730,3 +730,82 @@ def test_a_turn_is_a_response_and_not_an_event():
 
     # The tracker is working state, not a finding, and does not reach the report.
     assert "last_message" not in json.loads(report.model_dump_json())
+
+
+# --------------------------------------------------------------------------- #
+# The fence
+# --------------------------------------------------------------------------- #
+
+
+def fenced(argv: list[str], ws: Path) -> subprocess.CompletedProcess:
+    """Run `argv` under exactly the fence a codex session of this launch would get."""
+    import fence
+
+    if not fence.supported():
+        pytest.skip("this kernel has no Landlock, so there is no fence to test")
+    full = run.fenced_argv(AGENTS["codex"], ["codex"], ws, ws)
+    wrapped = full[: full.index("--")] + ["--", *argv]
+    return subprocess.run(wrapped, cwd=ws, capture_output=True, text=True, timeout=60)
+
+
+def reads(path: Path, ws: Path) -> bool:
+    """Whether a fenced session can read this file."""
+    return fenced(["cat", str(path)], ws).returncode == 0
+
+
+def test_a_fenced_session_cannot_read_what_it_is_meant_to_be_playing_for(tmp_path):
+    """The reach this exists to close, named file by file. Each of these was read by
+    a real session in its first thirty actions: the package carries every achievement
+    by name, `tools/route.py` is a scripted player that walks the early tech tree,
+    and the launch's own record says what the run has already scored."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+
+    assert not reads(ROOT / "tools" / "route.py", ws), "the walkthrough is readable"
+    assert not reads(ROOT / "run.py", ws), "the launcher is readable"
+    package = run.site_packages(ROOT / ".env-venv") / "craftax"
+    assert not reads(package / "craftax" / "constants.py", ws), "the answer is readable"
+    # Not a file, because which of the operator's notes exist differs by machine and
+    # an assertion that passes because nothing was there proves nothing. The home
+    # directory always exists, and a session that cannot list it cannot walk it.
+    listed = fenced(["ls", str(Path.home())], ws)
+    assert listed.returncode != 0, "the operator's home is walkable"
+
+
+def test_the_fence_keeps_everything_a_session_plays_with(tmp_path):
+    """Fenced too tight is a run that cannot play, and the failure would arrive as a
+    session that scored nothing rather than as an error. `./act` is the whole of what
+    a session does, so what it runs on has to survive: the two files it is made of,
+    an interpreter to run them, and a workspace it can write."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+
+    assert reads(ROOT / "act.py", ws), "the agent's own command is unreadable"
+    assert reads(ROOT / "craftax_game.py", ws), "act.py cannot import what it needs"
+    # The import machinery lists the directory a script sits in; granted as a listing
+    # and not as files, which is why the two above are named one by one.
+    listing = fenced(["ls", str(ROOT)], ws)
+    assert listing.returncode == 0, "act.py cannot be imported from its own directory"
+
+    done = fenced(["sh", "-c", "echo kept > notes.md && cat notes.md"], ws)
+    assert done.stdout.strip() == "kept", "a session cannot keep notes"
+
+
+def test_the_agents_interpreter_still_opens_an_observation(tmp_path):
+    """The frame channel, end to end. A fence that left numpy or Pillow outside would
+    take away the one thing the benchmark measures this arm on."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    done = fenced([str(run.AGENT_PYTHON), "-c",
+                   "import numpy, PIL.Image; print('opened')"], ws)
+    assert done.stdout.strip() == "opened", done.stderr
+
+
+def test_only_the_arm_that_reached_for_the_answer_is_fenced():
+    """The asymmetry, stated where it can be checked. Fencing the Claude arm would
+    change what its finished 30k pass means; leaving this one unfenced would make its
+    score a measurement of reading the tech tree."""
+    assert AGENTS["codex"].FENCED, "the arm that reached is unfenced"
+    assert not AGENTS["claude"].FENCED, "fencing this arm rewrites a finished result"
+    blank = run.Report(label="W", workspace="/w")
+    assert blank.fenced is False, "a report claims a fence it was not given"
