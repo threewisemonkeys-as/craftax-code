@@ -285,9 +285,10 @@ def codex_session(lines: list[str], got: dict, model: str) -> dict:
             got["kinds"]["file"] = got["kinds"].get("file", 0) + 1
         elif shape and "compact" in shape:
             got["compactions"] += 1
-    # Reasoning tokens are billed as output and are most of the spend on a hard game,
-    # so the total includes them — as it does in the launcher's own accounting.
-    got["output_total"] = usage["output"] + usage["thinking"]
+    # Reasoning is a part of `output_tokens`, not a term beside it: the CLI's own
+    # rollout reports `total_tokens == input_tokens + output_tokens`. Adding it again,
+    # as this once did, billed it twice.
+    got["output_total"] = usage["output"]
     got["thinking_total"] = usage["thinking"]
     got["cost"] = priced(SimpleNamespace(
         model=model,

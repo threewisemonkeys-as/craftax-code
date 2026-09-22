@@ -50,8 +50,12 @@ from typing import Any, Protocol
 # output for the whole request. These usage figures are per session, not per
 # request, so that cannot be applied honestly — which makes the cost of a long
 # game a floor rather than a figure.
+#
+# `gpt-6-astra` is later and from one source: openrouter.ai's model listing, read
+# 2026-09-22, which also carries the >272K override above (2x input, 1.5x output).
 PRICES: dict[str, dict[str, float]] = {
     "gpt-5.6-sol": {"input": 5.00, "cached": 0.50, "write": 6.25, "output": 30.00},
+    "gpt-6-astra": {"input": 10.00, "cached": 1.00, "write": 12.50, "output": 50.00},
 }
 
 # An event the launcher appended to a stream after the session that produced it had
@@ -432,11 +436,11 @@ class Codex:
         elif kind == "turn.completed":
             usage = event.get("usage", {})
             report.input_tokens = usage.get("input_tokens", 0)
-            # Reasoning tokens are billed as output and are most of the spend on
-            # a hard game, so they belong in the output count, not beside it.
-            report.output_tokens = usage.get("output_tokens", 0) + usage.get(
-                "reasoning_output_tokens", 0
-            )
+            # Reasoning is already inside this. The CLI's own rollout reports
+            # `total_tokens == input_tokens + output_tokens`, with reasoning a part of
+            # the second rather than a third term — so this used to add it again and
+            # bill it twice. The first 30k Codex pass was launched before the fix.
+            report.output_tokens = usage.get("output_tokens", 0)
             report.cache_read_tokens = usage.get("cached_input_tokens", 0)
             report.cache_creation_tokens = usage.get("cache_write_input_tokens", 0)
             report.cost_usd = cost(report)

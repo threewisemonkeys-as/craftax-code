@@ -313,13 +313,13 @@ def test_a_codex_session_reports_what_its_stream_carries(tmp_path):
     assert got["batches"] == [4]
     assert got["frames"] == 1
     assert got["errors"] == 1, "a non-zero exit is a tool error"
-    # Reasoning is billed as output and is most of the spend on a hard game, so the
-    # total includes it — as it does in the launcher's own accounting.
-    assert got["output_total"] == 1500 and got["thinking_total"] == 500
+    # Reasoning is a part of the output, not a term beside it — the CLI's own rollout
+    # reports `total_tokens == input_tokens + output_tokens` — so it is billed once.
+    assert got["output_total"] == 1000 and got["thinking_total"] == 500
     # Priced here, because this CLI reports tokens and no cost. Fresh input is the
     # total less what was cached or written.
     assert got["cost"] == pytest.approx(
-        (100_000 * 5.00 + 900_000 * 0.50 + 1500 * 30.00) / 1e6)
+        (100_000 * 5.00 + 900_000 * 0.50 + 1000 * 30.00) / 1e6)
 
 
 def test_a_codex_session_says_what_it_cannot_measure(tmp_path):
