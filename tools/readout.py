@@ -30,10 +30,16 @@ import json
 import re
 import sys
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "rig"))
+
+from agents import HARVESTED  # noqa: E402
+from agents import cost as priced  # noqa: E402
 
 from act import RESET  # noqa: E402
 
@@ -192,17 +198,126 @@ def batches_from_log(ws: Path) -> list[int]:
     return sizes
 
 
-def session(stream: Path) -> dict:
-    """Read one session's event stream.
+def whose(lines: list[str]) -> str:
+    """Which CLI wrote this stream, from the first event that names its own shape.
 
-    Two things about the stream that the arithmetic has to respect. One API response
-    arrives as several `assistant` events — a thinking block, a text block, a tool
-    call — all carrying the same `message.id` and the same usage, so summing events
-    counts one request three times. And the `output_tokens` on those events is a
-    snapshot taken before the response finished: over a whole session they add to 297
-    where the result event reports 33,784. So the input side is read per message and
-    the output side only in total, with each turn's *share* of it taken from the
+    Sniffed rather than passed in, because this reads a file and the answer is in the
+    file. A readout that took the agent from the launch's report would be reading one
+    of them and grading the other whenever a report was missing, stale, or written by
+    a launch that predated the column.
+    """
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type", "")
+        if kind.startswith(("thread.", "turn.", "item.")) or kind == HARVESTED:
+            return "codex"
+        if kind in ("system", "assistant", "user", "result"):
+            return "claude"
+    return "claude"
+
+
+def codex_session(lines: list[str], got: dict, model: str) -> dict:
+    """Read one session's event stream, where that session was played by Codex.
+
+    Its own function rather than a branch, because the two CLIs share almost nothing
+    here: this stream has no per-request usage, no timestamps on its items, and no
+    cost at all. What that costs the readout is the depth table — the question *what
+    did each turn cost as the context grew* cannot be answered from this stream,
+    because the CLI reports one usage figure for the whole session and apportioning
+    it over the turns would be inventing exactly the number the table is for. So
+    `turn_rows` is left empty and `missing` says why, rather than printing a table
+    built from a guess.
+
+    Two figures here are not in the stream in any form. Cost is computed from the
+    model's published prices, the same arithmetic the launcher's report uses, and is
+    zero when the price is unknown. Frames come from the items the launcher harvested
+    out of the CLI's own history and folded in; a stream that never went through that
+    step honestly reports none.
+    """
+    usage = {"input": 0, "cached": 0, "written": 0, "output": 0, "thinking": 0}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind, item = event.get("type"), event.get("item") or {}
+        shape = item.get("type")
+        if kind == HARVESTED and shape == "imageView":
+            got["frames"] += 1
+            got["tool_calls"] += 1
+            got["tools"]["ViewImage"] = got["tools"].get("ViewImage", 0) + 1
+        elif kind != "item.completed":
+            # One `turn.completed` per session, so a chain of them accumulates. The
+            # Claude reader below assigns instead, which on a chained run reports the
+            # last session's figures for the whole run — see `main`.
+            if kind == "turn.completed":
+                counts = event.get("usage", {})
+                usage["input"] += counts.get("input_tokens", 0)
+                usage["cached"] += counts.get("cached_input_tokens", 0)
+                usage["written"] += counts.get("cache_write_input_tokens", 0)
+                usage["output"] += counts.get("output_tokens", 0)
+                usage["thinking"] += counts.get("reasoning_output_tokens", 0)
+            continue
+        elif shape == "agent_message":
+            # What the adapter counts as a turn: this CLI bills one turn per prompt,
+            # so its messages are the closer analogue of a Claude assistant turn.
+            got["turns"] += 1
+        elif shape == "command_execution":
+            got["tool_calls"] += 1
+            got["tools"]["Bash"] = got["tools"].get("Bash", 0) + 1
+            command = str(item.get("command", ""))
+            for label, pattern in KIND:
+                if pattern.search(command):
+                    got["kinds"][label] = got["kinds"].get(label, 0) + 1
+                    break
+            else:
+                got["kinds"]["shell"] = got["kinds"].get("shell", 0) + 1
+            if size := batch_size(command):
+                got["batches"].append(size)
+            if item.get("exit_code"):
+                got["errors"] += 1
+        elif shape in ("file_change", "patch_apply"):
+            got["tool_calls"] += 1
+            got["tools"]["Edit"] = got["tools"].get("Edit", 0) + 1
+            got["kinds"]["file"] = got["kinds"].get("file", 0) + 1
+        elif shape and "compact" in shape:
+            got["compactions"] += 1
+    # Reasoning tokens are billed as output and are most of the spend on a hard game,
+    # so the total includes them — as it does in the launcher's own accounting.
+    got["output_total"] = usage["output"] + usage["thinking"]
+    got["thinking_total"] = usage["thinking"]
+    got["cost"] = priced(SimpleNamespace(
+        model=model,
+        input_tokens=usage["input"],
+        output_tokens=got["output_total"],
+        cache_read_tokens=usage["cached"],
+        cache_creation_tokens=usage["written"],
+    ))
+    # Not zero — absent. This CLI's stream carries no rate-limit window, no wall
+    # clock, no stop reason, and no way to tell a session that never compacted from
+    # one whose compactions it did not mention.
+    got["missing"] = ["five_hour", "seven_day", "limit_status", "duration_ms",
+                      "stop_reason", "compactions", "turn_rows"]
+    return got
+
+
+def session(stream: Path, model: str = "") -> dict:
+    """Read one session's event stream, whichever CLI wrote it.
+
+    Two things about the Claude stream that the arithmetic has to respect. One API
+    response arrives as several `assistant` events — a thinking block, a text block, a
+    tool call — all carrying the same `message.id` and the same usage, so summing
+    events counts one request three times. And the `output_tokens` on those events is
+    a snapshot taken before the response finished: over a whole session they add to
+    297 where the result event reports 33,784. So the input side is read per message
+    and the output side only in total, with each turn's *share* of it taken from the
     characters it actually produced.
+
+    `model` is only ever used to price a Codex session, which is the one thing about
+    it that no event reports.
     """
     got = {
         "turns": 0, "tool_calls": 0, "compactions": 0, "frames": 0,
@@ -210,11 +325,17 @@ def session(stream: Path) -> dict:
         "five_hour": 0.0, "seven_day": 0.0, "limit_status": "", "limits": 0,
         "turn_rows": [], "errors": 0, "result": "", "stop_reason": "",
         "duration_ms": 0, "num_turns": 0, "output_total": 0, "thinking_total": 0,
+        # Fields this CLI's stream does not carry, so that a reader can tell an
+        # unmeasured figure from a measured zero.
+        "missing": [],
     }
     if not stream.exists():
         return got
+    lines = stream.read_text(errors="replace").splitlines()
+    if whose(lines) == "codex":
+        return codex_session(lines, got, model)
     turns: dict[str, dict] = {}
-    for line in stream.read_text(errors="replace").splitlines():
+    for line in lines:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -280,15 +401,27 @@ def session(stream: Path) -> dict:
             got["limit_status"] = info.get("status", "")
             got["limits"] += 1
         elif kind == "result":
-            got["cost"] = event.get("total_cost_usd", 0.0)
+            # One result event per session, and a stinted run's stream holds every
+            # session it was played by — so these accumulate. Assigned, they reported
+            # the *last* session's figures as the whole run's: the published 30,000
+            # action run read $10.76 against the $654 its own report banked, and 32
+            # minutes against sixteen hours. `thinking_total` below always
+            # accumulated, which is what made it visible — the line printed more
+            # thinking than output, because the two were counting different runs.
+            got["cost"] += event.get("total_cost_usd", 0.0)
+            got["duration_ms"] += event.get("duration_ms", 0)
+            got["num_turns"] += event.get("num_turns", 0)
+            usage = event.get("usage", {})
+            got["output_total"] += usage.get("output_tokens", 0)
+            # Not `model`: that is this function's argument now, and a loop that
+            # rebound it would leave the pricing of a Codex session depending on
+            # whether a Claude one had been read first.
+            for used in (event.get("modelUsage") or {}).values():
+                got["thinking_total"] += used.get("thinkingTokens", 0)
+            # These two are the last session's on purpose: what the run ended up
+            # saying, and why it stopped, are properties of the session that finished.
             got["result"] = str(event.get("result", ""))[:400]
             got["stop_reason"] = str(event.get("stop_reason") or event.get("subtype") or "")
-            got["duration_ms"] = event.get("duration_ms", 0)
-            got["num_turns"] = event.get("num_turns", 0)
-            usage = event.get("usage", {})
-            got["output_total"] = usage.get("output_tokens", 0)
-            for model in (event.get("modelUsage") or {}).values():
-                got["thinking_total"] += model.get("thinkingTokens", 0)
     got["turn_rows"] = list(turns.values())
     got["turns"] = len(turns)
     # The output side, distributed over the turns by what each of them wrote. An
@@ -354,6 +487,11 @@ def depth(got: dict, bands: int = 5) -> list[list]:
 # --------------------------------------------------------------------------- #
 
 
+def reported(absent: set[str], field: str, text: str) -> str:
+    """`text`, unless this CLI's stream does not carry the figure behind it."""
+    return "not in this CLI's stream" if field in absent else text
+
+
 def table(rows: list[list]) -> str:
     if not rows:
         return "  (nothing)\n"
@@ -413,12 +551,24 @@ def main() -> int:
             print("what fired, and when")
             print(table(unlocks(rows)))
 
-        got = session(root / label / "agent_stream.jsonl")
+        # The report is the only place the model is written down, and a Codex session
+        # cannot be priced without it. Absent — an older launch, or one that failed
+        # before writing it — the cost column reads zero, which is the honest answer
+        # rather than a figure invented from a default.
+        report = root / RIG / "reports" / f"{label}.json"
+        played_by = json.loads(report.read_text()) if report.exists() else {}
+        got = session(root / label / "agent_stream.jsonl", played_by.get("model", ""))
         batches = sorted(batches_from_log(root / label))
         actions = record["actions_used"]
+        # Absent, not zero. Each CLI's stream carries a different subset of this, and
+        # a readout that printed `0 min` for a wall clock nobody reported would be
+        # the most confident line on the page.
+        absent = set(got["missing"])
+        said = partial(reported, absent)
         print("the session")
         print(f"  turns {got['turns']}, tool calls {got['tool_calls']}, "
-              f"compactions {got['compactions']}, tool errors {got['errors']}")
+              f"compactions {said('compactions', str(got['compactions']))}, "
+              f"tool errors {got['errors']}")
         print(f"  by kind      {got['kinds']}")
         print(f"  by tool      {got['tools']}")
         if batches:
@@ -435,20 +585,31 @@ def main() -> int:
         if got["tool_calls"]:
             print(f"  actions per tool call  {actions / got['tool_calls']:.1f}")
         print(f"  frames in context      {got['frames']}")
-        print(f"  wall clock             {got['duration_ms'] / 60000:.0f} min")
+        clock = f"{got['duration_ms'] / 60000:.0f} min"
+        print(f"  wall clock             {said('duration_ms', clock)}")
         per = f"  (${1000 * got['cost'] / actions:.2f} per 1000 actions)" if actions else ""
-        print(f"  cost                   ${got['cost']:.2f}{per}")
-        print(f"  five-hour window       {got['five_hour']:.0%}"
-              f"  (seven-day {got['seven_day']:.0%}, "
-              f"status {got['limit_status'] or '?'})")
+        # Whose arithmetic produced it, because the two are not the same measurement:
+        # one CLI reports what it billed, the other reports tokens and is priced here.
+        how = " (from published prices, not reported)" if "turn_rows" in absent else ""
+        print(f"  cost                   ${got['cost']:.2f}{per}{how}")
+        window = (f"{got['five_hour']:.0%}  (seven-day {got['seven_day']:.0%}, "
+                  f"status {got['limit_status'] or '?'})")
+        print(f"  five-hour window       {said('five_hour', window)}")
         print(f"  output                 {got['output_total']:,} tokens "
               f"({got['thinking_total']:,} of it thinking)")
-        print(f"  ended                  {got['stop_reason'] or '?'}")
+        print(f"  ended                  {said('stop_reason', got['stop_reason'] or '?')}")
         if got["result"]:
             print(f"  said                   {got['result'][:200]}")
-        print("\ncost at depth  (* apportioned from the session total, not measured "
-              "per turn)")
-        print(table(depth(got)))
+        if "turn_rows" in absent:
+            # Not an empty table. This CLI reports one usage figure for a whole
+            # session and puts no timestamp on its items, so there is nothing to band
+            # by: every column of this table would be a guess dressed as a reading.
+            print("\ncost at depth  (not available: this CLI reports usage once per "
+                  "session, so there is no per-turn figure to band)")
+        else:
+            print("\ncost at depth  (* apportioned from the session total, not "
+                  "measured per turn)")
+            print(table(depth(got)))
     return 0
 
 

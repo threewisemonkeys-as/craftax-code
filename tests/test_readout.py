@@ -18,7 +18,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "rig"))
 
+from agents import HARVESTED  # noqa: E402
 from baselines import REPLAY, REPLAY_ACHIEVEMENTS, REPLAY_SEED  # noqa: E402
 from readout import (  # noqa: E402
     batch_size,
@@ -29,6 +31,7 @@ from readout import (  # noqa: E402
     replay,
     session,
     unlocks,
+    whose,
 )
 
 
@@ -262,3 +265,97 @@ def test_the_log_knows_the_batches_even_when_the_stream_does_not(tmp_path):
     )
     assert sorted(batches_from_log(tmp_path)) == [1, 3, 12]
     assert batches_from_log(tmp_path / "nowhere") == []
+
+
+# --------------------------------------------------------------------------- #
+# The other CLI
+# --------------------------------------------------------------------------- #
+
+
+def codex_stream(path: Path, *events: dict) -> Path:
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    return path
+
+
+def item(kind: str, **rest) -> dict:
+    return {"type": "item.completed", "item": {"type": kind} | rest}
+
+
+def test_a_codex_stream_is_recognised_without_being_told(tmp_path):
+    """Sniffed from the file rather than taken from the launch's report: a readout
+    that trusted the report would read one CLI and grade the other whenever the
+    report was missing, or written by a launch predating the column."""
+    assert whose([json.dumps({"type": "thread.started"})]) == "codex"
+    assert whose([json.dumps({"type": "system", "subtype": "init"})]) == "claude"
+    assert whose(["not json at all", json.dumps({"type": "turn.completed"})]) == "codex"
+    assert whose([]) == "claude", "an empty stream cannot be a finding"
+
+
+def test_a_codex_session_reports_what_its_stream_carries(tmp_path):
+    got = session(codex_stream(
+        tmp_path / "s.jsonl",
+        {"type": "thread.started"},
+        item("agent_message", text="I will probe left"),
+        item("command_execution", command='./act do left*4 --plan "probe"',
+             exit_code=0),
+        item("command_execution", command="./python parse.py", exit_code=1),
+        {"type": HARVESTED, "at": 10, "item": {"type": "imageView", "path": "/f.png"}},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 1_000_000, "cached_input_tokens": 900_000,
+            "cache_write_input_tokens": 0, "output_tokens": 1000,
+            "reasoning_output_tokens": 500}},
+    ), model="gpt-5.6-sol")
+
+    assert got["turns"] == 1
+    assert got["tool_calls"] == 3, "looking at a frame is a tool call on both arms"
+    assert got["tools"] == {"Bash": 2, "ViewImage": 1}
+    assert got["kinds"] == {"act do": 1, "python": 1}
+    assert got["batches"] == [4]
+    assert got["frames"] == 1
+    assert got["errors"] == 1, "a non-zero exit is a tool error"
+    # Reasoning is billed as output and is most of the spend on a hard game, so the
+    # total includes it — as it does in the launcher's own accounting.
+    assert got["output_total"] == 1500 and got["thinking_total"] == 500
+    # Priced here, because this CLI reports tokens and no cost. Fresh input is the
+    # total less what was cached or written.
+    assert got["cost"] == pytest.approx(
+        (100_000 * 5.00 + 900_000 * 0.50 + 1500 * 30.00) / 1e6)
+
+
+def test_a_codex_session_says_what_it_cannot_measure(tmp_path):
+    """Absent, not zero. A readout that printed `0 min` for a wall clock nobody
+    reported would be the most confident line on the page, and the depth table would
+    be five bands of arithmetic over a number this CLI reports once per session."""
+    got = session(codex_stream(tmp_path / "s.jsonl", {"type": "thread.started"}))
+    for field in ("duration_ms", "stop_reason", "five_hour", "compactions",
+                  "turn_rows"):
+        assert field in got["missing"], field
+    assert depth(got) == [], "a depth table over no per-turn figure is a guess"
+    # And the other arm claims nothing of the sort.
+    claude = session(codex_stream(
+        tmp_path / "c.jsonl", {"type": "system", "subtype": "init"}))
+    assert claude["missing"] == []
+
+
+def test_a_chained_runs_cost_is_the_runs_and_not_its_last_sessions(tmp_path):
+    """A stinted run's stream holds a result event per session. Assigned rather than
+    accumulated, these reported the last session's figures as the whole run's: the
+    published 30,000-action run read $10.76 against the $654 its own report banked,
+    and 32 minutes against sixteen hours. What made it visible was that thinking
+    always accumulated, so the line printed more thinking than output."""
+    got = session(codex_stream(
+        tmp_path / "s.jsonl",
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "total_cost_usd": 100.0, "duration_ms": 60_000,
+         "num_turns": 7, "usage": {"output_tokens": 2000},
+         "modelUsage": {"m": {"thinkingTokens": 500}}, "result": "first"},
+        {"type": "result", "total_cost_usd": 4.5, "duration_ms": 30_000,
+         "num_turns": 3, "usage": {"output_tokens": 300},
+         "modelUsage": {"m": {"thinkingTokens": 100}}, "result": "last"},
+    ))
+    assert got["cost"] == pytest.approx(104.5)
+    assert got["duration_ms"] == 90_000 and got["num_turns"] == 10
+    assert got["output_total"] == 2300 and got["thinking_total"] == 600
+    assert got["output_total"] >= got["thinking_total"], "counting different runs"
+    # What the run ended up saying is the last session's, on purpose.
+    assert got["result"] == "last"

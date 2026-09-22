@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import sqlite3
 import subprocess
 import time
 import sys
@@ -13,6 +14,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "rig"))
+
+from agents import AGENTS, HARVESTED  # noqa: E402
 
 import run  # noqa: E402
 from craftax_game import VARIANTS  # noqa: E402
@@ -308,7 +311,7 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "act", fake_act)
     monkeypatch.setattr(run, "one_session", fake_session)
     monkeypatch.setattr(run, "refresh_brief", lambda w: None)
-    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
     monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
     (tmp_path / ".envs" / "W").mkdir(parents=True)
     (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
@@ -331,8 +334,15 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
     report, opened = go(stint=0)
     assert report.sessions == 1 and len(opened) == 1
 
+    # `go` carries on the same workspace, so this is a second launch of the run the
+    # first one started — which is the whole reason the two numbers below differ.
+    # `opened` is one `act init` per session *this launch* played, and `sessions` is
+    # every session the *run* has been played by, the first launch's included. This
+    # asserted 3 against the second of those, which was right until a run was allowed
+    # to outlive a launch and stopped being right without anything failing.
     report, opened = go(stint=10)
-    assert report.sessions == 3, "a stinted run stopped chaining"
+    assert len(opened) == 3, "a stinted run stopped chaining"
+    assert report.sessions == 4, "the run's session count lost the launch before this"
     assert all("--resume" in one for one in opened), "a chained session restarted the world"
     assert all("--stint" in one for one in opened)
 
@@ -427,7 +437,7 @@ def test_a_session_that_plays_nothing_is_retried_and_then_gives_up(tmp_path, mon
     monkeypatch.setattr(run, "act", fake_act)
     monkeypatch.setattr(run, "one_session", lambda *a: _nothing())
     monkeypatch.setattr(run, "refresh_brief", lambda w: None)
-    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
     monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
     (tmp_path / ".envs" / "W").mkdir(parents=True)
     (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
@@ -480,7 +490,7 @@ def test_telemetry_is_banked_across_the_sessions_of_one_run(tmp_path, monkeypatc
     monkeypatch.setattr(run, "act", fake_act)
     monkeypatch.setattr(run, "one_session", fake_session)
     monkeypatch.setattr(run, "refresh_brief", lambda w: None)
-    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
     monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
     (tmp_path / ".envs" / "W").mkdir(parents=True)
     (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
@@ -527,7 +537,7 @@ def test_a_session_that_never_reported_banks_nothing_twice(tmp_path, monkeypatch
     monkeypatch.setattr(run, "act", fake_act)
     monkeypatch.setattr(run, "one_session", fake_session)
     monkeypatch.setattr(run, "refresh_brief", lambda w: None)
-    monkeypatch.setattr(run, "session_config", lambda r, label: tmp_path / "cfg")
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
     monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
     (tmp_path / ".envs" / "W").mkdir(parents=True)
     (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
@@ -544,3 +554,179 @@ def test_a_session_that_never_reported_banks_nothing_twice(tmp_path, monkeypatch
     report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
                                   asyncio.Semaphore(1)))
     assert report.cost_usd == pytest.approx(15.0)
+
+
+# --------------------------------------------------------------------------- #
+# The other CLI
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_is_handed_the_same_workspace_and_a_narrower_machine():
+    """Two things at once, because they are the same requirement. The brief must be
+    the file both arms read, so that a workspace differs between them in nothing; and
+    what the session can reach beyond it must be narrowed by name, since this CLI has
+    no denylist to pass and ships a browser and agents of its own switched on."""
+    codex = AGENTS["codex"]
+    argv = codex.argv("PLAY", codex.model, Path("/ws"))
+    flat = " ".join(argv)
+
+    assert 'project_doc_fallback_filenames=["CLAUDE.md"]' in argv, "reads AGENTS.md only"
+    assert "--ignore-user-config" in argv, "the operator's config would decide the model"
+    assert "tools.web_search=false" in argv
+    assert "tools.view_image=true" in argv, "the frame channel is what it is measured on"
+    for feature in ("browser_use", "computer_use", "multi_agent", "plugins"):
+        assert f"--disable {feature}" in flat
+    # Its own sandbox cannot start on this machine, and a session whose every command
+    # fails answers the prompt anyway rather than stopping. See the class docstring.
+    assert "danger-full-access" in argv and "workspace-write" not in argv
+    assert argv[-1] == "PLAY", "anything after the prompt is read as part of it"
+
+
+def test_a_session_gets_the_config_directory_its_own_cli_reads(tmp_path, monkeypatch):
+    """The same walk, guarded the same way, for a CLI that spells all three of the
+    directory, the credential and the variable differently."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    codex = AGENTS["codex"]
+    theirs = home / ".codex" / "auth.json"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text(json.dumps({"last_refresh": "2026-09-21T19:43:44.604670599Z"}))
+
+    config = run.session_config(tmp_path / "launch", "B4XPT", codex)
+    assert config == tmp_path / "launch" / ".sessions" / "B4XPT" / ".codex"
+    link = config / "auth.json"
+    assert link.is_symlink() and link.resolve() == theirs.resolve()
+    # And the same keep-the-fresher rule, on a stamp that is an age rather than an
+    # expiry: a session that refreshed its own copy does not get it taken away.
+    link.unlink()
+    link.write_text(json.dumps({"last_refresh": "2026-09-22T19:43:44.000000Z"}))
+    run.session_config(tmp_path / "launch", "B4XPT", codex)
+    assert not link.is_symlink(), "the refreshed token was replaced by an older one"
+
+
+def history(home: Path, rows: list[tuple[int, dict]]) -> Path:
+    """A CLI thread history holding `rows`, as the real one is shaped."""
+    home.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(home / AGENTS["codex"].HISTORY)
+    db.execute("create table thread_items (created_at_ms int, item_json text)")
+    db.executemany("insert into thread_items values (?, ?)",
+                   [(at, json.dumps(item)) for at, item in rows])
+    db.commit()
+    db.close()
+    return home
+
+
+def test_a_frame_opened_by_eye_is_counted_and_audited(tmp_path):
+    """The failure this exists to prevent is silent. This CLI's stream carries no
+    event for looking at an image, so before harvesting, a session could open every
+    observation it had — or the answer key — and the stream would show none of it:
+    the frame count read zero and the audit, which is a claim about everything a
+    session reached, had never seen the reach."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    home = history(tmp_path / "home", [
+        (1000, {"type": "imageView", "path": "/ws/frames/000001.png"}),
+        (1001, {"type": "agentMessage", "text": "not this"}),
+    ])
+    codex, report = AGENTS["codex"], run.Report(label="W", workspace=str(ws))
+
+    at = run.harvest(codex, home, ws, report, since=0.0)
+    assert at == 1000
+    assert report.tool_calls == 1, "looking at a frame is a tool call on both arms"
+
+    events = [json.loads(line)
+              for line in (ws / "agent_stream.jsonl").read_text().splitlines()]
+    assert [e["type"] for e in events] == [HARVESTED], "the message was harvested too"
+    assert sum(codex.images(e) for e in events) == 1
+    assert codex.ran(events[0]) == ["/ws/frames/000001.png"], "the audit cannot see it"
+
+
+def test_a_frame_is_not_harvested_twice(tmp_path):
+    """A run's sessions share one history and a run outlives the launch that started
+    it, so the watermark has to be recoverable from the stream itself: read back as
+    zero, a continued run would append every frame the first launch harvested a
+    second time and count them all again."""
+    ws = tmp_path / "W"
+    ws.mkdir()
+    home = history(tmp_path / "home", [(1000, {"type": "imageView", "path": "/a.png"})])
+    codex, report = AGENTS["codex"], run.Report(label="W", workspace=str(ws))
+
+    run.harvest(codex, home, ws, report, since=0.0)
+    assert run.harvested_since(ws) == 1000, "a later launch cannot find the watermark"
+    run.harvest(codex, home, ws, report, since=run.harvested_since(ws))
+
+    assert report.tool_calls == 1
+    assert len((ws / "agent_stream.jsonl").read_text().splitlines()) == 1
+
+
+def test_a_shell_that_could_not_start_is_told_apart_from_giving_up():
+    """Not the agent's doing, and it does not get better with a retry: when the shell
+    cannot start this CLI answers the prompt out of what it expected the commands to
+    produce, which leaves a session that spoke and ran nothing."""
+    codex = AGENTS["codex"]
+    assert codex.no_commands(turns=3, tool_calls=0)
+    assert not codex.no_commands(turns=3, tool_calls=9), "it ran things and stopped"
+    assert not codex.no_commands(turns=0, tool_calls=0), "it never started"
+    assert not AGENTS["claude"].no_commands(turns=3, tool_calls=0)
+
+
+def test_a_report_that_predates_a_field_is_silent_about_it_not_zero(tmp_path):
+    """The bug this exists to prevent cost a published run a session, silently.
+
+    A run outlives a launch, so every launch after the first reads what the run had
+    already spent out of the report it is about to rotate. A field that report does
+    not carry is a field it is *silent* about — and for `sessions` the difference is
+    load-bearing, because a report exists only if a run was played. Read as zero, the
+    3,000-action pilot that started the published run vanished: the 30,000-action run
+    it grew into reported 12 sessions against the 13 result events in its own stream,
+    while its cost — a field that report did carry — came through correctly.
+    """
+    reports = tmp_path / run.RIG / "reports"
+    reports.mkdir(parents=True)
+    # Exactly the shape of that pilot's report: a cost, no session count.
+    (reports / "W.json").write_text(json.dumps({"cost_usd": 104.57, "turns": 997}))
+
+    was = run.carried(tmp_path, "W", resuming=True)
+    assert was["sessions"] == 1, "the session that produced this report was dropped"
+    assert was["cost_usd"] == pytest.approx(104.57)
+    assert was["compactions"] == 0, "a silent counter is still nought"
+
+    # And a run with nothing behind it has played nothing, which is the other case:
+    # no prior run at all is not the same as a prior run that did not say.
+    fresh = run.carried(tmp_path, "W", resuming=False)
+    assert fresh["sessions"] == 0 and fresh["cost_usd"] == 0
+
+
+def test_a_turn_is_a_response_and_not_an_event():
+    """One API response arrives as several `assistant` events — a thinking block, a
+    text block, a tool call — all carrying the same `message.id`. Counted per event,
+    a turn stopped meaning a response: the published 30,000-action run reported 7,239
+    turns for 3,774 responses.
+
+    What hid it is that `tool_calls` is immune — a `tool_use` block is counted once
+    wherever the split puts it — so the report agreed with the read-out on tool calls
+    and disagreed on turns, and only one of those two was ever compared.
+    """
+    claude, report = AGENTS["claude"], run.Report(label="W", workspace="/x")
+
+    def assistant(ident, *blocks):
+        return {"type": "assistant", "message": {"id": ident, "content": list(blocks)}}
+
+    thinking = {"type": "thinking", "thinking": "..."}
+    text = {"type": "text", "text": "probing left"}
+    call = {"type": "tool_use", "name": "Bash", "input": {"command": "./act do left"}}
+
+    for event in (assistant("msg_1", thinking), assistant("msg_1", text),
+                  assistant("msg_1", call), assistant("msg_2", call)):
+        claude.absorb(report, event)
+    assert report.turns == 2, "one response counted more than once"
+    assert report.tool_calls == 2, "a tool call is counted wherever the split puts it"
+
+    # An id-less event has nothing to group it by, and folding every one of them under
+    # a single absent id would be the opposite mistake.
+    claude.absorb(report, assistant(None, text))
+    claude.absorb(report, assistant(None, text))
+    assert report.turns == 4
+
+    # The tracker is working state, not a finding, and does not reach the report.
+    assert "last_message" not in json.loads(report.model_dump_json())

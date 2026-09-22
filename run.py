@@ -46,13 +46,13 @@ from itertools import count
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 REPO = Path(__file__).resolve().parent
 # rig/ is not a package, so that a sandbox can overwrite any of it between builds.
 sys.path.insert(0, str(REPO / "rig"))
 
-from agents import AGENTS  # noqa: E402
+from agents import AGENTS, HARVESTED  # noqa: E402
 from audit import Audit, audit_session  # noqa: E402
 
 from act import DEFAULT_BUDGET, RESULT  # noqa: E402
@@ -140,8 +140,14 @@ class Report(BaseModel):
     exit_code: int = 0
     seconds: float = 0.0
     audit: Audit = Audit()
+    # One API response, however many events it arrived as. See `Claude.absorb`.
     turns: int = 0
     tool_calls: int = 0
+    # Which response the last event belonged to, so that the several events one
+    # response arrives as are counted once. Working state rather than a finding, so
+    # it is kept off the report: an adapter needs somewhere to remember this, and it
+    # cannot be the adapter, which is one object shared by every world in a launch.
+    last_message: str | None = Field(default=None, exclude=True)
     # How many agent sessions played this run. More than one means it was stinted:
     # every counter above is the sum over all of them, and every score below is the
     # run's, because the run is the thing they were all playing.
@@ -193,11 +199,15 @@ def child_env(api_key: str | None) -> dict[str, str]:
     The parent's CLAUDE_* variables identify *this* session; inheriting them would
     make the child a continuation of it rather than a session of its own, and would
     bill it accordingly. (arc-code, run.py)
+
+    CODEX_* for the same reason and one more: CODEX_HOME is how a session is given a
+    configuration directory of its own, and a value inherited from whoever launched
+    the run would put every session back in the operator's.
     """
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_"))
+        if not k.startswith(("CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_", "CODEX_"))
     }
     env.pop("ANT_API_KEY", None)
     if api_key:
@@ -289,14 +299,18 @@ def credential_life(path: Path) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def session_config(root: Path, label: str) -> Path:
+def session_config(root: Path, label: str, agent=None) -> Path:
     """A config directory of this session's own, seeded with the CLI's credential.
 
     The CLI keeps its sessions and its memory of a project under its config
-    directory, which by default is the operator's ``~/.claude`` — where the
-    operator's own notes on this very harness live. A session is told about its
-    memory directory, so listing the parent is a short walk to a sibling project's
-    notes; pointing the whole tree somewhere else removes that walk.
+    directory, which by default is the operator's ``~/.claude`` — or ``~/.codex``,
+    which holds the same kind of thing under different names: a prompt history, a
+    memories store and a log of every session the operator has run. A session is told
+    about its memory directory, so listing the parent is a short walk to a sibling
+    project's notes; pointing the whole tree somewhere else removes that walk.
+
+    Which directory, which credential file and which of two copies is the fresher are
+    the CLI's business and live in its adapter. Everything below is the same for both.
 
     Mitigation and not prevention: an absolute path still reaches the real one, and
     until a sandbox exists only the audit stands there.
@@ -319,15 +333,16 @@ def session_config(root: Path, label: str) -> Path:
     after inherits the refreshed copy — for as long as the refresh token lives, which
     is about a month rather than about eight hours.
     """
-    config = root / ".sessions" / label / ".claude"
+    agent = agent or AGENTS["claude"]
+    config = root / ".sessions" / label / agent.CONFIG_DIR
     config.mkdir(parents=True, exist_ok=True)
-    credential = Path.home() / ".claude" / ".credentials.json"
-    link = config / ".credentials.json"
+    credential = Path.home() / agent.CONFIG_DIR / agent.CREDENTIAL
+    link = config / agent.CREDENTIAL
     if not credential.exists():
         return config
     if link.is_symlink() and link.resolve() == credential.resolve():
         return config
-    if credential_life(link)[0] > credential_life(credential)[0]:
+    if agent.freshness(link) > agent.freshness(credential):
         return config
     link.unlink(missing_ok=True)
     link.symlink_to(credential)
@@ -395,9 +410,26 @@ def carried(root: Path, label: str, resuming: bool) -> dict[str, float]:
     """
     path = rig_dir(root) / "reports" / f"{label}.json"
     if not resuming or not path.exists():
+        # Nothing was played before this launch, so every one of these is nought —
+        # including `sessions`, whose blank below is one. The two cases differ: there
+        # being no prior run is not the same as a prior run not having said.
         return dict.fromkeys(CARRIED, 0)
     was = json.loads(path.read_text())
-    return {field: was.get(field) or 0 for field in CARRIED}
+    # A field a report does not carry is a field that report is silent about, not a
+    # field it says is zero, and the two differ for exactly one of these. A report
+    # exists because a run was played, so a missing `sessions` is one session and not
+    # none — and read as none, the session that started the run vanished from every
+    # total after it. That is what happened here: the 3,000-action pilot was written
+    # before this field existed, so the 30,000-action run it grew into reported 12
+    # sessions against the 13 its own stream records.
+    #
+    # The blanks are the report's own defaults rather than a list kept alongside, so
+    # a field added later cannot acquire a second, wrong, default here.
+    blanks = {field: Report.model_fields[field].default for field in CARRIED}
+    return {
+        field: blanks[field] if (value := was.get(field)) is None else value
+        for field in CARRIED
+    }
 
 
 def assign_labels(root: Path, plan: list[tuple[str, int]]) -> dict[str, tuple[str, int]]:
@@ -470,6 +502,52 @@ async def one_session(
     stderr = (await proc.stderr.read()).decode(errors="replace")
     await proc.wait()
     return stderr, proc.returncode or 0
+
+
+def harvested_since(ws: Path) -> float:
+    """The newest harvested item already folded into this run's stream.
+
+    Read back out of the stream rather than kept in memory, because a run outlives
+    the process that started it: a `--continue` picks up a workspace whose stream
+    already holds every frame the earlier launch harvested, and a watermark starting
+    at zero would append all of them a second time and count them twice.
+    """
+    path = ws / "agent_stream.jsonl"
+    if not path.exists():
+        return 0.0
+    best = 0.0
+    # A line at a time, and the cheap test first. This file runs to hundreds of
+    # megabytes on a long run and all but a handful of its lines are not this, so
+    # reading it whole to find them would cost more memory than the run it resumes.
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            if HARVESTED not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == HARVESTED:
+                best = max(best, float(event.get("at", 0)))
+    return best
+
+
+def harvest(agent, home: Path, ws: Path, report: "Report", since: float) -> float:
+    """Fold what the CLI recorded but did not stream into the session's stream.
+
+    Appended after the session that produced it has ended, because that is when the
+    CLI's own record is complete and no longer being written to. The events carry
+    their own type, so the stream stays honest about which of its lines came off a
+    stdout and which were read back out of a database afterwards.
+    """
+    events = agent.harvest(home, since)
+    if not events:
+        return since
+    with (ws / "agent_stream.jsonl").open("a", buffering=1) as stream:
+        for event in events:
+            stream.write(json.dumps(event) + "\n")
+            agent.absorb(report, event)
+    return max(float(event.get("at", since)) for event in events)
 
 
 async def play(
@@ -567,8 +645,10 @@ async def play(
             # starting the daemon; and every handover is a clean process, which over
             # twenty hours matters more than the minutes it costs.
             banked = {field: was[field] for field in BANKED}
+            watermark = harvested_since(ws)
             for n in count(1):
                 before = played(ws)
+                turns_before, calls_before = report.turns, report.tool_calls
                 # Zeroed so each session contributes exactly its own figures: one
                 # that is killed before its result event contributes nothing rather
                 # than the running total a second time.
@@ -580,9 +660,14 @@ async def play(
                 # symlink with a copy of whatever the credential was when it last
                 # refreshed a token, and a chain of sessions can outlive that by
                 # many hours (F13).
-                session_env = env | {"CLAUDE_CONFIG_DIR": str(session_config(root, label))}
+                home = session_config(root, label, agent)
+                session_env = env | {agent.CONFIG_ENV: str(home)}
                 stderr, report.exit_code = await one_session(
                     argv, ws, session_env, report, agent)
+                # Before anything reads the stream, and inside the loop rather than
+                # after it: a chain's sessions share one record, and each has to be
+                # taken while it is the newest thing in it.
+                watermark = harvest(agent, home, ws, report, watermark)
                 report.sessions = int(was["sessions"]) + n
                 for field in BANKED:
                     banked[field] += getattr(report, field)
@@ -593,6 +678,16 @@ async def play(
                     # whatever it had not written down.
                     print(f"[{label}] session {n} exited {report.exit_code}: "
                           f"{' '.join(stderr.split())[-200:]}", flush=True)
+                # Why a session played nothing, when the adapter can tell from the
+                # shape of its stream. Here rather than in the retry branch below,
+                # which a run without a stint never reaches: a first smoke run is
+                # exactly where this diagnosis is worth the most, and exactly the
+                # run that would otherwise be told only that nothing was played.
+                if played(ws) <= before:
+                    why = getattr(agent, "no_commands", lambda *_: "")(
+                        report.turns - turns_before, report.tool_calls - calls_before)
+                    if why:
+                        print(f"[{label}] session {n} {why}", flush=True)
 
                 state = json.loads((ws / "state.json").read_text())
                 if state["terminal"]:
@@ -678,7 +773,8 @@ async def play(
         if report.unapproved_tools:
             print(
                 f"[{label}] registered but not approved: "
-                f"{', '.join(report.unapproved_tools)} — extend Claude.DENIED",
+                f"{', '.join(report.unapproved_tools)} — extend "
+                f"{type(agent).__name__}.DENIED",
                 flush=True,
             )
         if report.audit.named_the_game:
@@ -893,6 +989,21 @@ async def main() -> int:
                   f"refresh token {(refresh - now) / 86400:.1f} days. Sessions "
                   f"refresh their own, so the refresh token is the one that has to "
                   f"outlast the run.", flush=True)
+    if args.agent == "codex":
+        # This CLI has no per-request key to hand a session: it signs in once and
+        # every session inherits a copy of that login. So there is one thing to check
+        # and one thing to say about the number it will produce.
+        agent = AGENTS["codex"]
+        auth = Path.home() / agent.CONFIG_DIR / agent.CREDENTIAL
+        if not agent.freshness(auth):
+            print(f"run: no usable codex login at {auth} — every session will fail "
+                  f"to authenticate. Run `codex login` before starting.", flush=True)
+        else:
+            print(f"run: codex login last refreshed "
+                  f"{(time.time() - agent.freshness(auth)) / 3600:.1f}h ago. Sessions "
+                  f"inherit a copy and refresh their own; the cost column is computed "
+                  f"from this model's published prices, not reported by the CLI.",
+                  flush=True)
 
     if args.replay and args.carry_on:
         raise SystemExit(

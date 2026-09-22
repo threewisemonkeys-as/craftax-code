@@ -19,9 +19,20 @@ at one is a legitimate channel — it is the channel `play_craftax` gives a pers
 so `images()` counts how many entered a session's context rather than fencing them
 off. It is a measurement, not a finding, and on a run this long it is the one that
 says whether the frames are being parsed or eyeballed.
+
+Where a CLI's stream does not answer all four, the adapter says where the rest is
+kept rather than reporting zero: `harvest` reads back what a session did that its own
+stdout left out, and the launcher folds it into the stream before anything reads it.
+That is the difference between a measurement of nothing and nothing measured, and on
+the frame count it is also the difference between an audit that saw everything and
+one that only appeared to.
 """
 
+import json
 import os
+import re
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -43,10 +54,23 @@ PRICES: dict[str, dict[str, float]] = {
     "gpt-5.6-sol": {"input": 5.00, "cached": 0.50, "write": 6.25, "output": 30.00},
 }
 
+# An event the launcher appended to a stream after the session that produced it had
+# ended, read back out of the CLI's own records rather than off its stdout. Its own
+# type, so that a stream stays honest about where each line came from and nothing
+# downstream mistakes one for something the CLI streamed. See `Codex.harvest`.
+HARVESTED = "harvested.item"
+
 
 class Agent(Protocol):
     name: str
     model: str
+    # Where the CLI keeps its sessions and its credential, and the variable that
+    # moves the whole tree somewhere this launch owns. Both CLIs default to a
+    # directory under the operator's home, which is where the operator's own notes
+    # on this harness live — see `session_config` in run.py.
+    CONFIG_ENV: str
+    CONFIG_DIR: str
+    CREDENTIAL: str
 
     def argv(self, task: str, model: str, ws: Path) -> list[str]: ...
     def absorb(self, report: Any, event: dict) -> None: ...
@@ -54,6 +78,8 @@ class Agent(Protocol):
     def results(self, event: dict) -> list[str]: ...
     def web(self, event: dict) -> int: ...
     def images(self, event: dict) -> int: ...
+    def freshness(self, path: Path) -> float: ...
+    def harvest(self, home: Path, since: float) -> list[dict]: ...
 
 
 class Claude:
@@ -61,6 +87,9 @@ class Claude:
 
     name = "claude"
     model = "claude-opus-5"
+    CONFIG_ENV = "CLAUDE_CONFIG_DIR"
+    CONFIG_DIR = ".claude"
+    CREDENTIAL = ".credentials.json"
     # The agent acts through ./act and reasons with a shell and files, so these
     # are pre-approved for an unattended session.
     #
@@ -125,8 +154,24 @@ class Claude:
     def absorb(self, report: Any, event: dict) -> None:
         kind = event.get("type")
         if kind == "assistant":
-            report.turns += 1
-            said = event.get("message", {}).get("content", [])
+            message = event.get("message", {})
+            # One API response arrives as several `assistant` events — a thinking
+            # block, a text block, a tool call — all carrying the same `message.id`.
+            # Counted per event, a turn stopped meaning a response: the published
+            # 30,000-action run reported 7,239 turns for 3,774 responses, 1.92 events
+            # to a response. `tool_calls` below is immune, because a `tool_use` block
+            # is counted once wherever the split puts it — which is why the two
+            # disagreed with the readout for years without anything looking wrong.
+            #
+            # An id-less event is counted on its own: there is nothing to group it by,
+            # and grouping them all under one absent id would be the opposite error.
+            ident = message.get("id")
+            if not ident:
+                report.turns += 1
+            elif ident != report.last_message:
+                report.turns += 1
+                report.last_message = ident
+            said = message.get("content", [])
             report.tool_calls += sum(1 for b in said if b.get("type") == "tool_use")
         elif kind == "system" and event.get("subtype") == "compact_boundary":
             report.compactions += 1
@@ -216,18 +261,88 @@ class Claude:
                 )
         return seen
 
+    def freshness(self, path: Path) -> float:
+        """When this stored login's access token runs out, as POSIX seconds.
+
+        Only ever compared against another copy of the same credential, so what it
+        means matters less than that later is better and unreadable is worst. Zero
+        for anything missing or malformed, which makes those the same answer: this
+        file is not worth keeping.
+        """
+        try:
+            oauth = json.loads(path.read_text()).get("claudeAiOauth") or {}
+            return float(oauth.get("expiresAt") or 0) / 1000
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0.0
+
+    def harvest(self, home: Path, since: float) -> list[dict]:
+        """Nothing: this CLI's stream is the whole of what it did."""
+        return []
+
+    def no_commands(self, turns: int, tool_calls: int) -> str:
+        """Nothing: this CLI has no silent failure this shape would catch."""
+        return ""
+
 
 class Codex:
-    """`codex exec --json`.
+    """`codex exec --json`, fenced by configuration and read from two sources.
 
-    Sandboxed to the workspace with network access, because the agent has to
-    reach the broker; approvals off, because nobody is watching. Codex's own
-    sandbox is redundant inside the E2B fence but costs nothing and is the honest way to
-    ask, rather than the flag named for bypassing it.
+    Three things about this CLI that the Claude adapter never has to think about.
+
+    **Its own sandbox cannot start here.** `workspace-write` and `read-only` run
+    every command through bubblewrap, which needs an unprivileged user namespace,
+    and this machine sets `kernel.apparmor_restrict_unprivileged_userns=1`. So each
+    one dies with `bwrap: setting up uid map: Permission denied` — and the model does
+    not stop when that happens. Asked to write a file and read it back, it reported
+    the contents it expected; no file existed. A session of this harness would play
+    no actions, score zero, and look from the launcher exactly like one that read the
+    workspace and gave up. So the sandbox is off, which is also what the Claude arm
+    runs with: neither CLI is fenced by the OS here, and the audit and the
+    interpreter split are what stand there. `no_commands` below is the residual
+    check, because a shell that cannot start is worth telling apart from a session
+    that chose not to use one.
+
+    **Its tool surface is a configuration, not a flag.** There is no denylist to
+    pass. What a session can reach is decided by features that ship on, a browser and
+    other agents among them, so `DISABLED` is the analogue of `Claude.DENIED` and
+    `tools.web_search` is turned off by name.
+
+    **Half of what it does is not in its stream.** `--json` carries messages,
+    commands and file changes and nothing else. A `view_image` call — the frame
+    channel this benchmark is measured on — produces no event at all: a session can
+    open a hundred observations and the stream will show none of them. The CLI's own
+    thread history records each one with its path, so `harvest` reads it back at the
+    end of a session and the launcher folds it into the stream. Without that both the
+    frame count and the audit are blind to every image a session opened, and the
+    audit's claim to have seen everything would be false rather than merely partial.
     """
 
     name = "codex"
     model = "gpt-5.6-sol"
+    CONFIG_ENV = "CODEX_HOME"
+    CONFIG_DIR = ".codex"
+    CREDENTIAL = "auth.json"
+    # The transcript the JSON stream leaves out, under CONFIG_ENV. Versioned by the
+    # CLI: a newer one would land beside this rather than replace it, which `harvest`
+    # reports rather than silently reading nothing.
+    HISTORY = "thread_history_1.sqlite"
+    # The analogue of Claude.DENIED. Every one of these is stable and on by default,
+    # and every one is a way out of a workspace: a browser, the desktop, agents of
+    # its own, plugins, and skills read from wherever the CLI finds them. Disabling
+    # is not the same as denying — an unknown name here is ignored rather than
+    # refused — so, as on the Claude side, what a session actually reached is
+    # established by the audit and not by this list.
+    DISABLED = (
+        "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+        "computer_use", "image_generation", "apps", "in_app_browser",
+        "multi_agent", "plugins", "remote_plugin", "skill_search", "hooks",
+        "tool_suggest",
+    )
+    # The brief is about 8KB and the CLI's own default cap is smaller than this by
+    # enough to matter. Named rather than defaulted because a truncated brief is a
+    # silent difference between the two arms — the Codex session would be playing
+    # with less of the prompt and nothing would say so.
+    PROJECT_DOC_MAX = 131072
     # How hard it thinks per turn. Set once for a whole batch through the
     # environment, because it belongs to the run rather than to a game, and the
     # upper levels cost enough to be a deliberate choice rather than a default.
@@ -238,10 +353,16 @@ class Codex:
     EFFORT = os.environ.get("ARCSEC_EFFORT", "high")
 
     def argv(self, task: str, model: str, ws: Path) -> list[str]:
-        return [
+        if self.EFFORT not in self.LEVELS:
+            raise SystemExit(f"codex: effort {self.EFFORT!r} is not one of {self.LEVELS}")
+        argv = [
             "codex",
             "exec",
             "--json",
+            # Without this the operator's ~/.codex/config.toml decides the model, the
+            # effort and which plugins load — on this machine it sets all three, and
+            # marks the directory this harness sits in as trusted.
+            "--ignore-user-config",
             "-m",
             model,
             "-c",
@@ -249,14 +370,32 @@ class Codex:
             "-c",
             "approval_policy=never",
             "-c",
-            "sandbox_workspace_write.network_access=true",
+            "tools.web_search=false",
+            # The frame channel, and the one thing here turned on rather than off. It
+            # is what `play_craftax` gives a person and what the Claude arm has, so a
+            # run without it would be measuring a different agent on a different game.
+            "-c",
+            "tools.view_image=true",
+            # Both arms are handed a workspace that differs in nothing, down to the
+            # filename. This CLI reads AGENTS.md; the fallback makes ours its project
+            # doc without a second copy of the brief to drift from the first.
+            "-c",
+            'project_doc_fallback_filenames=["CLAUDE.md"]',
+            "-c",
+            f"project_doc_max_bytes={self.PROJECT_DOC_MAX}",
+            # See the class docstring: its own sandbox cannot start on this machine,
+            # and a session whose every command fails does not say so.
             "-s",
-            "workspace-write",
+            "danger-full-access",
             "--skip-git-repo-check",
             "-C",
             str(ws),
-            task,
         ]
+        for feature in self.DISABLED:
+            argv += ["--disable", feature]
+        # Last, and positional: anything after it would be read as part of the prompt.
+        argv.append(task)
+        return argv
 
     def absorb(self, report: Any, event: dict) -> None:
         kind = event.get("type")
@@ -266,6 +405,11 @@ class Codex:
             # Its messages are the closer analogue of Claude's assistant turns.
             report.turns += 1
         elif kind == "item.completed" and item.get("type") == "command_execution":
+            report.tool_calls += 1
+        elif kind == HARVESTED and item.get("type") == "imageView":
+            # Looking at a frame is a tool call on the Claude side, where it is a
+            # Read of a PNG, so it is one here too — otherwise the two arms' tool
+            # counts would be measuring different sets of things.
             report.tool_calls += 1
         elif kind == "turn.completed":
             usage = event.get("usage", {})
@@ -281,6 +425,14 @@ class Codex:
 
     def ran(self, event: dict) -> list[str]:
         item = event.get("item", {})
+        if event.get("type") == HARVESTED:
+            # A path, not a command, and the reason harvesting exists at all: the
+            # audit is a claim about everything a session reached, and `view_image`
+            # reaches a file. Before this, opening the answer key as a picture was
+            # the one way to read it that left no trace anywhere.
+            if item.get("type") == "imageView":
+                return [str(item.get("path", ""))]
+            return []
         if event.get("type") != "item.completed":
             return []
         if item.get("type") == "command_execution":
@@ -296,9 +448,89 @@ class Codex:
         return []
 
     def images(self, event: dict) -> int:
-        """Codex\'s stream does not distinguish an image result from a text one, so
-        this says nothing rather than guessing. A Codex pass has no frame count."""
-        return 0
+        """How many frames this session read by eye rather than through a script.
+
+        Not from the stream, which carries no such event, but from the thread history
+        `harvest` folded into it — so this counts only what a launcher harvested. A
+        stream read without that step reports no frames, which is the truth about
+        that file rather than a claim about the session.
+        """
+        if event.get("type") != HARVESTED:
+            return 0
+        return int(event.get("item", {}).get("type") == "imageView")
+
+    def freshness(self, path: Path) -> float:
+        """When this credential was last refreshed, as POSIX seconds.
+
+        Claude's answer to the same question is an expiry and this one is an age,
+        which does not matter: the only thing either is used for is choosing between
+        two copies of one credential, where later is better and unreadable is worst.
+
+        The CLI writes nanoseconds and `fromisoformat` takes at most microseconds, so
+        the fraction is truncated rather than parsed.
+        """
+        try:
+            stamp = json.loads(path.read_text())["last_refresh"]
+            stamp = re.sub(r"(\.\d{6})\d+", r"\1", str(stamp).replace("Z", "+00:00"))
+            return datetime.fromisoformat(stamp).timestamp()
+        except (OSError, ValueError, TypeError, KeyError):
+            return 0.0
+
+    def harvest(self, home: Path, since: float) -> list[dict]:
+        """The items this session's stream left out, newer than `since`.
+
+        `since` is a millisecond timestamp and not a row count, because a run's
+        sessions share one history: every session after the first would otherwise
+        re-harvest the ones before it, and every frame would be counted again.
+
+        Returns events shaped like the stream's own so that the launcher can append
+        them to it and everything downstream — this adapter, the audit, the readout —
+        keeps reading one file. Failure is empty: a history that cannot be opened
+        costs a run its frame count, and that is worth reporting through the count
+        itself rather than by killing a session that has already been played.
+        """
+        history = home / self.HISTORY
+        if not history.exists():
+            return []
+        try:
+            # Read-only, and over a copy of nothing: the CLI may still hold a write
+            # lock on the WAL when a chained session starts, and a harvest must never
+            # be the thing that stops a run.
+            db = sqlite3.connect(f"file:{history}?mode=ro&immutable=0", uri=True)
+            try:
+                rows = db.execute(
+                    "select created_at_ms, item_json from thread_items "
+                    "where created_at_ms > ? order by created_at_ms",
+                    (int(since),),
+                ).fetchall()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return []
+        out = []
+        for at, blob in rows:
+            try:
+                item = json.loads(blob)
+            except (ValueError, TypeError):
+                continue
+            if item.get("type") != "imageView":
+                continue
+            out.append({"type": HARVESTED, "at": int(at), "item": item})
+        return out
+
+    def no_commands(self, turns: int, tool_calls: int) -> str:
+        """Why a session that played nothing played nothing, if this adapter knows.
+
+        One failure mode is worth naming because it is silent and is not the agent's
+        doing: when the shell cannot start, this CLI answers the prompt anyway, out
+        of what it expected the commands to produce. What that leaves behind is a
+        session that spoke and never ran anything — a shape a session that gave up
+        does not have, since giving up here takes reading the workspace first.
+        """
+        if turns and not tool_calls:
+            return ("it spoke and ran nothing at all — the shell could not start, "
+                    "and the model answered without it")
+        return ""
 
     def web(self, event: dict) -> int:
         """Codex reports no such counter, so this says nothing rather than zero.
