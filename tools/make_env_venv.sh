@@ -15,7 +15,7 @@ set -e
 cd "$(dirname "$0")/.."
 uv venv --python 3.12 .env-venv
 uv pip install --python .env-venv/bin/python \
-    "craftax==1.6.1" "pydantic>=2" python-dotenv pytest
+    "craftax==1.6.1" "pydantic>=2" python-dotenv pytest pytest-xdist
 # Building the texture cache is a one-minute job that otherwise happens inside
 # the first session, on the clock, in a directory the agent is watching.
 .env-venv/bin/python - <<'WARM'

@@ -30,6 +30,10 @@ CHOP = ["left", "left", "do", "do", "do"]
 # Standing still is fatal — hunger, thirst and fatigue drain whether or not you act.
 # Exactly 226 actions on craftax and 215 on classic, both from seed 0.
 STARVE = 400
+# The channel for a test that starves and never looks at a frame. Rendering and
+# encoding a pixel frame is ~47 ms an action, so a death on pixels costs ten seconds
+# or more; on the symbolic vector it costs one.
+CHEAP = ("symbolic",)
 
 
 @pytest.fixture
@@ -141,7 +145,7 @@ def test_a_death_stops_the_batch_and_the_next_life_begins(rig):
 
 
 def test_a_life_ending_costs_only_what_was_spent(rig):
-    session, _, _ = rig(budget=500)
+    session, _, _ = rig(budget=500, obs=CHEAP)
     run(session, ["noop"] * STARVE)
     assert session.state.actions_left == 500 - 226
     run(session, CHOP)
@@ -199,7 +203,7 @@ def test_the_curve_across_lives_is_kept_and_the_union_is_not_its_sum(rig):
     The same two achievements are earned twice, once in each life, and the union still
     says two. A session shown the sum across lives would read that as four, which is
     exactly what the pilot did with 715 of them."""
-    session, _, env_dir = rig(budget=600)
+    session, _, env_dir = rig(budget=600, obs=CHEAP)
     run(session, CHOP)
     run(session, ["noop"] * STARVE)  # stops early: this life is over
     assert session.state.deaths == 1 and session.state.lives == 2
@@ -240,9 +244,16 @@ def test_state_json_names_neither_the_achievements_nor_the_score(rig):
     assert "reward" not in on_disk
 
 
-def test_the_log_says_nothing_about_the_observation(rig):
-    """No hash, no changed-pixel count, no summary — the path, and that is all."""
-    session, ws, _ = rig(obs=("pixels", "text"))
+def test_the_log_says_nothing_about_the_observation(rig, monkeypatch):
+    """No hash, no changed-pixel count, no summary — the path, and that is all.
+
+    The text renderer is stubbed: at 381 ms a call, the 231 actions this needs to
+    reach a death cost ninety seconds, and what is checked is the log line that names
+    the file, not what the file says (`test_game.py` renders the real thing). The
+    second channel is the symbolic one for the same reason: every channel's line is
+    written by one function, so the cheapest of them checks it."""
+    session, ws, _ = rig(obs=("symbolic", "text"))
+    monkeypatch.setattr(session.game, "text", lambda: "a text render")
     run(session, CHOP)
     run(session, ["noop"] * STARVE)  # and through a death, which writes two of each
     for block in blocks(ws)[1:]:
@@ -250,7 +261,7 @@ def test_the_log_says_nothing_about_the_observation(rig):
             line for line in block.strip().splitlines()
             if line and not line.startswith(("action ", "plan:", "[event]"))
         ]
-        assert all(line.startswith(("[pixels] ", "[text] ")) for line in body), body
+        assert all(line.startswith(("[symbolic] ", "[text] ")) for line in body), body
 
 
 def test_the_reward_is_shown_and_what_paid_it_is_not(rig):

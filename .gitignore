@@ -21,6 +21,9 @@ dist/
 .env-venv/
 .agent-venv/
 
+# XLA's compiled `reset`/`step`/renderer, shared by test processes (tests/conftest.py)
+.jax-cache/
+
 # Secrets — never committed
 .env
 
