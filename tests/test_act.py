@@ -299,7 +299,7 @@ def test_a_resume_takes_the_world_from_the_record_not_the_workspace(rig, tmp_pat
     run(session, CHOP)
     session.state.save(ws)
     session.state.record()
-    args = type("A", (), {"budget": 0, "stint": 0})()
+    args = type("A", (), {"budget": 0, "stint": 0, "pause_on": [], "pause_min": 0})()
     assert act.pick_up(ws, args, env_dir).state.variant == "craftax"
     # Without the record there is no resume, rather than a resume of the default world.
     (env_dir / act.RESULT).unlink()
@@ -669,3 +669,95 @@ def test_the_record_is_replaced_and_never_written_in_place(rig, monkeypatch):
     assert target not in seen, "result.json was written in place"
     assert json.loads(target.read_text())["actions_used"] == 2
     assert not list(env_dir.glob("*.tmp")), "a temporary file was left behind"
+
+
+# --------------------------------------------------------------------------- #
+# The pause schedule: a stint that events can end early
+# --------------------------------------------------------------------------- #
+
+
+def scheduled(cap=10, floor=3, on=("death", "level", "reward")):
+    state = RunState(budget=100, pause_on=list(on), pause_min=floor)
+    state.begin_stint(cap)
+    return state
+
+
+def step(state, *events):
+    state.actions_used += 1
+    return state.note_events(list(events))
+
+
+def test_an_event_ends_the_session_once_the_floor_has_passed():
+    state = scheduled()
+    for _ in range(3):
+        step(state)
+    assert step(state, "reward")
+    assert state.stint_over and state.last_pause == 4 and state.pauses[-1]["events"] == ["reward"]
+
+
+def test_an_event_before_the_floor_is_held_not_dropped():
+    state = scheduled()
+    assert not step(state, "death")
+    assert not step(state)
+    assert step(state), "the held death did not end the session at the floor"
+    assert state.pauses[-1] == {"at": 3, "since": 3, "events": ["death"], "cap": False}
+
+
+def test_the_cap_ends_a_quiet_session():
+    state = scheduled(cap=5)
+    fired = [step(state) for _ in range(5)]
+    assert fired == [False] * 4 + [True] and state.pauses[-1]["cap"]
+
+
+def test_events_outside_the_schedule_do_nothing():
+    state = scheduled(on=("death",))
+    for _ in range(4):
+        assert not step(state, "reward", "level")
+    assert step(state, "death")
+
+
+def test_a_new_session_counts_the_cap_from_the_last_pause_not_its_own_start():
+    state = scheduled(cap=10)
+    for _ in range(6):
+        step(state)
+    state.begin_stint(10)  # a session that quit early, and the next one begins
+    assert state.stint_end == 10, "the schedule's clock was reset by a restart"
+
+
+def test_without_a_schedule_a_stint_is_what_it_always_was():
+    state = RunState(budget=100)
+    state.begin_stint(10)
+    assert not step(state, "death", "reward") and state.stint_end == 10
+
+
+def test_the_schedule_is_kept_out_of_the_workspace(tmp_path):
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    env_dir.mkdir()
+    state = RunState(variant="classic", obs=["symbolic"], budget=20, env_dir=str(env_dir),
+                     pause_on=["death"], pause_min=2)
+    state.begin_stint(5)
+    Session.create(ws, state)
+    public = json.loads((ws / act.STATE).read_text())
+    assert not {"pause_on", "pause_min", "pending", "pauses", "last_pause"} & set(public)
+    said = (ws / act.LOG).read_text()
+    assert "at most 5 of those actions are yours" in said and "may end sooner" in said
+
+
+def test_a_rebuild_restores_the_schedule_from_the_record(tmp_path):
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    common = ("--variant", "classic", "--env-dir", str(env_dir), "--obs", "symbolic",
+              "--budget", "30", "--stint", "4", "--pause-on", "death", "reward",
+              "--pause-min", "2")
+    try:
+        act_cli(ws, "init", *common)
+        act_cli(ws, "do", "noop*4")
+        was = json.loads((env_dir / act.RESULT).read_text())
+        assert was["last_pause"] == 4 and was["pauses"][-1]["cap"]
+        act_cli(ws, "init", *common, "--resume")
+        now = json.loads((env_dir / act.RESULT).read_text())
+        assert now["last_pause"] == 4 and now["pauses"] == was["pauses"]
+        assert now["stint_end"] == 8 and now["pause_on"] == ["death", "reward"]
+    finally:
+        subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)

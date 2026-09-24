@@ -57,7 +57,7 @@ sys.path.insert(0, str(REPO / "rig"))
 from agents import AGENTS, HARVESTED  # noqa: E402
 from audit import Audit, audit_session  # noqa: E402
 
-from act import DEFAULT_BUDGET, RESULT  # noqa: E402
+from act import DEFAULT_BUDGET, PAUSE_EVENTS, RESULT  # noqa: E402
 from craftax_game import CHANNELS, DEFAULT_CHANNELS, VARIANTS  # noqa: E402
 
 # Outside the repository on purpose. A workspace under it puts this harness's source,
@@ -126,6 +126,19 @@ CONTINUE_TASK = (
     "are yours. Continue with ./act until `./act status` reports this session is "
     "over, and before it does, leave notes.md fit for whoever comes next. Work "
     "autonomously and do not stop to ask questions."
+)
+# The B2 handover. Sent into the conversation of a session that has just been
+# paused, before the next one starts, so the summary is written by the session that
+# holds the context rather than reconstructed by the one that does not. Nothing is
+# playable at this point — the stint is spent — so it is a turn of writing only.
+SUMMARISE_TASK = (
+    "Your session is over: no more actions can be played in it, and the run carries "
+    "on in a new session that will have this workspace and nothing else — not your "
+    "context, not your reasoning. Before it starts, summarise into notes.md "
+    "everything it needs to continue well: what you have established about how this "
+    "world works, the state you are in now, what you were doing and why, and the "
+    "open questions worth testing next. Keep what is still true, correct what is "
+    "not, and make it readable cold. Do not try to play."
 )
 STREAM_LIMIT = 1 << 22  # single stream-json lines can be large
 # Telemetry an adapter *assigns* rather than adds, because the CLI reports one
@@ -208,6 +221,12 @@ class Report(BaseModel):
     # provider-reported counter is what says whether anything was reached — but a
     # tool that turns up here is one the denylist missed.
     unapproved_tools: list[str] = []
+
+    # -- the pause schedule and what the arm does at a pause ------------------ #
+    pause_on: list[str] = []
+    pause_min: int = 0
+    summarise: bool = False
+    summaries: int = 0
 
     @property
     def ok(self) -> bool:
@@ -724,6 +743,48 @@ async def one_session(
     return stderr, proc.returncode or 0
 
 
+def last_session_id(ws: Path) -> str | None:
+    """The CLI's id for the newest conversation in this run's stream."""
+    path = ws / "agent_stream.jsonl"
+    found = None
+    if not path.exists():
+        return None
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            if '"session_id"' not in line or '"init"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "system" and event.get("subtype") == "init":
+                found = event.get("session_id") or found
+    return found
+
+
+async def hand_over(agent, args, ws: Path, home: Path, session_env: dict[str, str],
+                    report: "Report", label: str) -> None:
+    """B2: ask the session that just paused to hand over, in its own conversation.
+
+    Not fatal. A handover that fails leaves the workspace as the session left it,
+    which is exactly B1 — so the run carries on and the failure is said.
+    """
+    sid = last_session_id(ws)
+    if not sid:
+        print(f"[{label}] no session id to resume — skipping the summary", flush=True)
+        return
+    argv = agent.argv(SUMMARISE_TASK, args.model, ws) + ["--resume", sid]
+    if report.fenced:
+        argv = fenced_argv(agent, argv, ws, home)
+    for field in BANKED:
+        setattr(report, field, 0)
+    stderr, code = await one_session(argv, ws, session_env, report, agent)
+    report.summaries += 1
+    if code:
+        print(f"[{label}] summary turn exited {code}: "
+              f"{' '.join(stderr.split())[-200:]}", flush=True)
+
+
 def harvested_since(ws: Path) -> float:
     """The newest harvested item already folded into this run's stream.
 
@@ -814,6 +875,9 @@ async def play(
                         tool_calls=int(was["tool_calls"]),
                         fenced=((agent.FENCED or getattr(args, "fence", False))
                                 and not getattr(args, "no_fence", False)),
+                        pause_on=list(getattr(args, "pause_on", [])),
+                        pause_min=getattr(args, "pause_min", 0),
+                        summarise=getattr(args, "summarise", False),
                         compactions=int(was["compactions"]))
 
         def briefed(n: int) -> str:
@@ -837,7 +901,10 @@ async def play(
                 "--stint", str(args.stint),
                 "--obs", *args.obs,
                 "--env-dir", str(env_dir),
+                "--pause-min", str(getattr(args, "pause_min", 0)),
             ]
+            if getattr(args, "pause_on", None):
+                out += ["--pause-on", *args.pause_on]
             # Always spelled out — see the daemon's argv in act.py for why a flag
             # that rides on a default is a flag waiting to disagree with itself.
             out.append("--fresh-world" if args.fresh_world else "--same-world")
@@ -918,6 +985,14 @@ async def play(
                         print(f"[{label}] session {n} {why}", flush=True)
 
                 state = json.loads((ws / "state.json").read_text())
+                if (getattr(args, "summarise", False) and not state["terminal"] and state["stint"]
+                        and state["actions_used"] >= state["stint_end"]
+                        and state["actions_used"] > before):
+                    await hand_over(agent, args, ws, home, session_env, report, label)
+                    watermark = harvest(agent, home, ws, report, watermark)
+                    for field in BANKED:
+                        banked[field] += getattr(report, field)
+                        setattr(report, field, banked[field])
                 if state["terminal"]:
                     break
                 if not args.stint:
@@ -1196,6 +1271,20 @@ async def main() -> int:
                             "rewards recording a good life and re-executing it, so "
                             "much of the budget stops being play")
     parser.set_defaults(fresh_world=True)
+    parser.add_argument(
+        "--pause-on", nargs="+", choices=PAUSE_EVENTS, default=[],
+        help="end a session early on these events; --stint becomes the cap. The "
+             "schedule an online-learning arm updates on, for the arms it is "
+             "compared against",
+    )
+    parser.add_argument("--pause-min", type=int, default=0,
+                        help="actions after a pause before another may happen; an "
+                             "earlier event is held, not dropped")
+    parser.add_argument(
+        "--summarise", action="store_true",
+        help="B2: at each handover, ask the session that is ending to summarise "
+             "into notes.md, in its own conversation, before the next one starts",
+    )
     parser.add_argument("--agent", default="claude", choices=sorted(AGENTS))
     fencing = parser.add_mutually_exclusive_group()
     fencing.add_argument(
@@ -1215,6 +1304,11 @@ async def main() -> int:
         help="build the workspaces and start the worlds, play none",
     )
     args = parser.parse_args()
+    if args.pause_on and not args.stint:
+        parser.error("--pause-on needs --stint, which is the cap on a session")
+    if args.summarise and args.agent != "claude":
+        parser.error("--summarise resumes the ending conversation, which only the "
+                     "claude adapter does so far")
 
     load_dotenv(REPO.parents[1] / ".env")
     args.model = args.model or AGENTS[args.agent].model

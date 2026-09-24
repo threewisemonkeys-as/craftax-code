@@ -436,6 +436,58 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
     assert all("--stint" in one for one in opened)
 
 
+def test_b2_asks_the_paused_session_to_summarise_in_its_own_conversation(tmp_path, monkeypatch):
+    """At a handover, and only at one: the conversation that holds the context is
+    resumed for one writing turn before the next session starts cold."""
+    calls, ws = [], tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False, "stint": 10,
+         "stint_end": 10}))
+    (ws / "agent_stream.jsonl").write_text(json.dumps(
+        {"type": "system", "subtype": "init", "session_id": "abc"}) + "\n")
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            calls.append(("init", argv))
+            played = json.loads((ws / "state.json").read_text())
+            played["actions_used"] += 10
+            played["stint_end"] = played["actions_used"]
+            played["terminal"] = played["actions_used"] >= 30
+            (ws / "state.json").write_text(json.dumps(played))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        calls.append(("session", argv))
+        return "", 0
+
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "refresh_brief", lambda w: None)
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    (tmp_path / ".envs" / "W").mkdir(parents=True)
+    (tmp_path / ".envs" / "W" / "result.json").write_text(json.dumps(
+        {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                        "episodes_completed", "mean_episode", "mean_episode_pct",
+                        "score", "score_pct", "lives", "deaths", "unique_cells",
+                        "max_level")} | {"episode_scores": [], "achievements": []}))
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 30,
+        "stint": 10, "max_sessions": 10, "fresh_world": True, "agent": "claude",
+        "model": "m", "dry_run": False, "retries": 2, "idle_wait": 0,
+        "pause_on": ["death", "reward"], "pause_min": 5, "summarise": True,
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    summaries = [a for kind, a in calls if kind == "session" and run.SUMMARISE_TASK in a]
+    assert len(summaries) == 2, "one summary per handover, none at the run's end"
+    assert all(a[-2:] == ["--resume", "abc"] for a in summaries)
+    assert report.summaries == 2 and report.summarise and report.pause_min == 5
+    inits = [a for kind, a in calls if kind == "init"]
+    assert all("--pause-on" in a and "--pause-min" in a for a in inits)
+
+
 # --------------------------------------------------------------------------- #
 # Surviving the night
 # --------------------------------------------------------------------------- #

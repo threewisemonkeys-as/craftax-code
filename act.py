@@ -79,6 +79,8 @@ RESET = "reset"
 # and a 200-action traverse should not cost 200 tokens of command line.
 REPEAT = re.compile(r"^([a-z0-9_]+)\*(\d+)$")
 MAX_REPEAT = 500
+# What may end a session early under a pause schedule (see RunState).
+PAUSE_EVENTS = ("death", "level", "reward")
 
 
 class ActError(SystemExit):
@@ -131,6 +133,24 @@ class RunState(BaseModel):
     stint_end: int = 0
     sessions: int = 1
 
+    # -- the pause ----------------------------------------------------------- #
+    # A stint that can end early. With `pause_on` set, `stint` is a cap (the N of an
+    # online-learning schedule) and certain events end the session sooner: a death,
+    # the first arrival at a deeper level than any before, a reward above zero. An
+    # event that comes before `pause_min` actions have passed since the last pause
+    # is held, not dropped, and ends the session once they have. Between sessions
+    # the launcher does whatever the arm does at a pause — nothing, a summary, a
+    # model update — which is the point of the machinery.
+    #
+    # Private, all four: which events end a session is the operator's schedule, and
+    # a session told "you are paused because you levelled" is being told what a
+    # level is. The session sees only that its share ended.
+    pause_on: list[str] = []
+    pause_min: int = 0
+    last_pause: int = 0
+    pending: list[str] = []
+    pauses: list[dict] = []
+
     # -- the score ----------------------------------------------------------- #
     # Read off the engine after every action and never shown. The achievement names
     # in particular are the tech tree: told that `make_wood_pickaxe` had fired, a
@@ -152,6 +172,7 @@ class RunState(BaseModel):
     PRIVATE: ClassVar[set[str]] = {
         "env_dir", "variant", "episodes", "achievements", "score", "max_score",
         "unique_cells", "max_level", "deaths", "reward",
+        "pause_on", "pause_min", "last_pause", "pending", "pauses",
     }
 
     def save(self, ws: Path) -> None:
@@ -215,9 +236,30 @@ class RunState(BaseModel):
         return bool(self.stint) and not self.terminal and self.stint_left <= 0
 
     def begin_stint(self, size: int) -> None:
-        """Hand the next `size` actions to a new session."""
+        """Hand the next `size` actions to a new session.
+
+        Under a pause schedule the cap counts from the last pause rather than from
+        this session's start, so a session that quit early does not reset the clock
+        the schedule runs on.
+        """
         self.stint = size
-        self.stint_end = self.actions_used + size if size else 0
+        start = self.last_pause if self.pause_on else self.actions_used
+        self.stint_end = max(start + size, self.actions_used + 1) if size else 0
+
+    def note_events(self, events: list[str]) -> bool:
+        """Fold this action's events into the schedule. True if the session pauses."""
+        if not self.pause_on or not self.stint:
+            return False
+        self.pending += [e for e in events if e in self.pause_on and e not in self.pending]
+        since = self.actions_used - self.last_pause
+        capped = since >= self.stint
+        if not ((self.pending or capped) and since >= self.pause_min):
+            return False
+        self.pauses.append({"at": self.actions_used, "since": since,
+                            "events": list(self.pending), "cap": capped})
+        self.pending, self.last_pause = [], self.actions_used
+        self.stint_end = self.actions_used
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -285,6 +327,17 @@ def stint_note(state: RunState) -> str:
     """What a session is told about being one of several. Nothing, when it is not."""
     if not state.stint:
         return ""
+    if state.pause_on:
+        return (
+            f"# stint: at most {state.stint} of those actions are yours, and your\n"
+            f"#   session may end sooner — the actuator decides when, and does not\n"
+            f"#   say in advance. The budget belongs to the run, not to you: when your\n"
+            f"#   session ends another one continues from exactly where you stopped,\n"
+            f"#   in the same world, with this workspace. It will have your files and\n"
+            f"#   nothing else — not your reasoning, not what you were about to try.\n"
+            f"#   `notes.md` is how you talk to it, and the only way anything you\n"
+            f"#   worked out survives.\n"
+        )
     return (
         f"# stint: {state.stint} of those actions are yours. The budget belongs to\n"
         f"#   the run, not to you: when your stint is spent this session is over and\n"
@@ -530,6 +583,7 @@ class Session:
         Returns a reason the batch should stop, or None.
         """
         state = self.state
+        deepest = self.game.max_level
         reward, alive = self.game.play(token)
 
         state.actions_used += 1
@@ -563,6 +617,14 @@ class Session:
             case "budget":
                 state.terminal, state.outcome = True, "budget"
                 stop = "budget spent"
+
+        # A rebuild replays the history with no stint and restores the schedule
+        # from the record afterwards, so the events are only read when it is live.
+        if not self.replaying and not state.terminal:
+            events = (["reward"] if reward > 0 else []) \
+                + (["death"] if not alive else []) \
+                + (["level"] if self.game.max_level > deepest else [])
+            state.note_events(events)
 
         # After the life and the run, because it is the weakest of the three: a
         # stint that ends on the same action the budget does is the run ending.
@@ -722,6 +784,8 @@ def start(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
         fresh_world=args.fresh_world,
         budget=args.budget or DEFAULT_BUDGET[args.variant],
         env_dir=str(env_dir),
+        pause_on=list(args.pause_on),
+        pause_min=args.pause_min,
     )
     # Before `create`, because the preamble it writes is where a session is told it
     # has a stint at all.
@@ -762,8 +826,15 @@ def pick_up(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
         budget=args.budget or was["budget"],
         env_dir=str(env_dir),
         sessions=int(was.get("sessions", 1)) + 1,
+        pause_on=list(args.pause_on),
+        pause_min=args.pause_min,
     )
     session = Session.resume(ws, state, list(was["history"]))
+    # Restored rather than replayed: the schedule is the launcher's, and a record
+    # written before it existed simply has none.
+    state.last_pause = int(was.get("last_pause", 0))
+    state.pending = list(was.get("pending", []))
+    state.pauses = list(was.get("pauses", []))
     state.begin_stint(args.stint)
     grew = state.budget - was["budget"]
     session.announce(
@@ -888,7 +959,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         "--budget", str(args.budget or DEFAULT_BUDGET[args.variant]),
         "--stint", str(args.stint),
         "--obs", *args.obs,
+        "--pause-min", str(args.pause_min),
     ]
+    if args.pause_on:
+        argv += ["--pause-on", *args.pause_on]
     # Spelled out rather than appended only when true. The default is fresh, and a
     # flag that is passed only on one side of a default leaves the daemon deciding
     # the world rule for itself — which is how the two ends come apart when a
@@ -956,6 +1030,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--stint", type=int, default=0,
                        help="actions one session may play before another takes over "
                             "(0: the whole budget, in one session)")
+        p.add_argument("--pause-on", nargs="+", choices=PAUSE_EVENTS, default=[],
+                       help="events that end a session before its --stint is spent "
+                            "(which then acts as a cap)")
+        p.add_argument("--pause-min", type=int, default=0,
+                       help="actions that must pass after a pause before another; an "
+                            "earlier event is held until then")
         p.add_argument("--resume", action="store_true",
                        help="rebuild the run already recorded here and carry it on")
         p.add_argument(
