@@ -21,6 +21,13 @@ import run  # noqa: E402
 from craftax_game import VARIANTS  # noqa: E402
 
 
+def said(path: Path) -> str:
+    """A brief's text with its line breaks taken out. `brief()` rewraps the
+    paragraphs it fills in, so where a phrase breaks depends on the words around it,
+    and a check for the phrase should not."""
+    return " ".join(path.read_text().split())
+
+
 def test_a_workspace_holds_the_prompt_and_two_shims(tmp_path):
     ws = run.make_workspace(tmp_path, "B4XPT", ["pixels"])
     assert sorted(p.name for p in ws.iterdir()) == ["CLAUDE.md", "act", "python"]
@@ -67,8 +74,8 @@ def test_the_brief_says_what_a_death_costs_and_it_matches_the_run(tmp_path):
     and a test that took either wording from the default would have gone on passing
     while saying nothing about the case it was named for.
     """
-    kept = (run.make_workspace(tmp_path / "k", "B4XPT", ["pixels"], False) / "CLAUDE.md").read_text()
-    dealt = (run.make_workspace(tmp_path / "f", "K7M3Q", ["pixels"], True) / "CLAUDE.md").read_text()
+    kept = said(run.make_workspace(tmp_path / "k", "B4XPT", ["pixels"], False) / "CLAUDE.md")
+    dealt = said(run.make_workspace(tmp_path / "f", "K7M3Q", ["pixels"], True) / "CLAUDE.md")
     assert "starts again from its beginning" in kept
     assert "a new world is dealt" in dealt
     assert "starts again from its beginning" not in dealt
@@ -105,7 +112,7 @@ def test_a_run_deals_a_new_world_each_life_unless_told_otherwise(tmp_path):
     with pytest.raises(SystemExit):
         parser.parse_args(["init", "--fresh-world", "--same-world"])
 
-    brief = (run.make_workspace(tmp_path, "B4XPT", ["pixels"]) / "CLAUDE.md").read_text()
+    brief = said(run.make_workspace(tmp_path, "B4XPT", ["pixels"]) / "CLAUDE.md")
     assert "a new world is dealt" in brief, "what a default run tells its session"
 
 
@@ -117,7 +124,18 @@ def test_a_refreshed_brief_takes_the_world_rule_from_the_record(tmp_path):
     (ws / "state.json").write_text(json.dumps(
         {"obs": ["pixels"], "fresh_world": True, "actions_used": 0, "terminal": False}))
     run.refresh_brief(ws)
-    assert "a new world is dealt" in (ws / "CLAUDE.md").read_text()
+    assert "a new world is dealt" in said(ws / "CLAUDE.md")
+
+
+def test_the_brief_is_wrapped_like_the_file_it_comes_from():
+    """Every placeholder sits inside a hand-wrapped paragraph, so a filled one left
+    a line of 110 characters in a file wrapped at 86, and the channel list 250. Every
+    combination the brief is built from, because each one fills in something else."""
+    for fresh_world in (True, False):
+        for channels in (["pixels"], list(run.CHANNELS)):
+            text = run.brief(channels, fresh_world)
+            long = [line for line in text.splitlines() if len(line) > run.WIDTH]
+            assert not long, (fresh_world, channels, long)
 
 
 def test_the_brief_says_what_the_run_is_judged_on(tmp_path):
