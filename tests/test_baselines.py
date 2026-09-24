@@ -79,12 +79,24 @@ def test_the_route_reads_the_true_state_and_writes_nothing(tmp_path):
 
 def test_noop_achieves_nothing_and_still_dies():
     """Thirst runs out around action 200 whether or not you move — which makes this
-    the cheapest check that the world is actually running."""
+    the cheapest check that the world is actually running.
+
+    Both regimes, because the death count is the one thing that separates them here.
+    A replayed world kills a still player at the same action every time, so 400
+    actions buy exactly one death; a new world each life kills at its own pace, and
+    the second death inside the same budget is the cheapest evidence that the
+    default really does deal a different world.
+    """
+    same = baselines.rollout("craftax", 0, "noop", 400, 0, fresh_world=False)
+    assert same["deaths"] == 1 and same["lives"] == 2
+    assert same["actions_used"] == 400
+
     got = baselines.rollout("craftax", 0, "noop", budget=400, trial=0)
     assert got["score"] == 0 and got["achievements"] == []
-    assert got["deaths"] == 1 and got["lives"] == 2
+    assert got["deaths"] >= 1 and got["lives"] == got["deaths"] + 1
     assert got["actions_used"] == 400
     assert got["unique_cells"] == 1, "standing still moved the player"
+    assert got["deaths"] > same["deaths"], "the fresh-world default replayed one world"
 
 
 def test_random_is_a_floor_not_a_policy():

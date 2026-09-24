@@ -9,9 +9,9 @@ time passes only when you act, so a `noop` is a real experiment. Any action may 
 repeated: `left*12`.
 
 There is one budget and it is shared. Every action counts against it, and nothing is
-held back for later. If you die the world starts again from its beginning and the run
-carries on spending the same budget — what dying cost you is the actions you had
-already spent. Nothing you can play ends a life; only the world does that.
+held back for later. {death} and the run carries on spending the same budget — what
+dying cost you is the actions you had already spent. Nothing you can play ends a life;
+only the world does that.
 
 Acting is sometimes rewarded. A number comes back with an action when it was worth
 something; part of what it measures is the change in your own condition, and part of it

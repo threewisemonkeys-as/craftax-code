@@ -72,6 +72,9 @@ def replay(record: dict) -> list[dict]:
         variant=record["variant"],
         seed=record["seed"],
         obs=("symbolic",),  # never written; the cheapest channel to not use
+        # `False`, not the current default: a record without the key predates the
+        # move to fresh worlds, and replaying it under the wrong rule would rebuild
+        # a different world than the one the run was played in.
         fresh_world=record.get("fresh_world", False),
     )
     rows, seen = [], set()

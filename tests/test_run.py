@@ -54,6 +54,72 @@ def test_the_brief_explains_no_mechanic(tmp_path):
         assert not re.search(rf"\b{word}\b", brief), f"the brief says {word!r}"
 
 
+def test_the_brief_says_what_a_death_costs_and_it_matches_the_run(tmp_path):
+    """The one sentence a session can act on between lives.
+
+    A run that replays one world rewards remembering it — a route, a map, a saved
+    opening — and a fresh world punishes exactly that. Both briefs existed as one
+    hardcoded sentence until a fresh-world run was asked for, which would have
+    been told the world repeats while it did not. Tie each wording to the setting so
+    the two cannot come apart again.
+
+    Both settings are passed explicitly. The default moved to fresh on 2026-09-24,
+    and a test that took either wording from the default would have gone on passing
+    while saying nothing about the case it was named for.
+    """
+    kept = (run.make_workspace(tmp_path / "k", "B4XPT", ["pixels"], False) / "CLAUDE.md").read_text()
+    dealt = (run.make_workspace(tmp_path / "f", "K7M3Q", ["pixels"], True) / "CLAUDE.md").read_text()
+    assert "starts again from its beginning" in kept
+    assert "a new world is dealt" in dealt
+    assert "starts again from its beginning" not in dealt
+    assert "{death}" not in kept and "{death}" not in dealt, "placeholder left unfilled"
+
+    # The whole assembled CLAUDE.md, not just the generated half. PROMPT.md carried
+    # "the same actions from the beginning do the same things" as fixed doctrine
+    # until 2026-09-24 — under a fresh world that is false, and it is also a recipe
+    # for the replay strategy that stops a run being played. Claims about what
+    # survives a death belong to the brief, which knows the setting.
+    for claim in ("the same one", "still holds", "the same actions from the beginning"):
+        assert claim not in dealt, f"a fresh-world brief still promises {claim!r}"
+
+
+def test_a_run_deals_a_new_world_each_life_unless_told_otherwise(tmp_path):
+    """The default moved from one replayed world to a fresh one on 2026-09-24.
+
+    A deterministic world is not the same benchmark played repeatedly — it is a
+    benchmark that stops being played. MP374 wrote itself a `replay.py` at action
+    5,753 and spent 69% of a 30,000-action budget re-executing a recorded life;
+    its last life made five decisions in 3,681 actions, and its union finished
+    three points above its best single life. Fresh worlds price that out.
+
+    The rule has to hold in three places at once, or a run is told one thing and
+    given another: the record's default, the actuator's CLI, and the brief.
+    """
+    import act  # noqa: PLC0415
+
+    assert act.RunState().fresh_world is True, "the record's default"
+    parser = act.build_parser()
+    assert parser.parse_args(["init"]).fresh_world is True, "the actuator's default"
+    assert parser.parse_args(["init", "--same-world"]).fresh_world is False
+    assert parser.parse_args(["serve", "--same-world"]).fresh_world is False, "and the daemon's"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["init", "--fresh-world", "--same-world"])
+
+    brief = (run.make_workspace(tmp_path, "B4XPT", ["pixels"]) / "CLAUDE.md").read_text()
+    assert "a new world is dealt" in brief, "what a default run tells its session"
+
+
+def test_a_refreshed_brief_takes_the_world_rule_from_the_record(tmp_path):
+    """`--continue` passes no `--fresh-world`, so a refreshed brief that read the
+    arguments would flip the rule under a run halfway through it. It reads the
+    record, as it already does for the channels."""
+    ws = run.make_workspace(tmp_path, "B4XPT", ["pixels"], True)
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "fresh_world": True, "actions_used": 0, "terminal": False}))
+    run.refresh_brief(ws)
+    assert "a new world is dealt" in (ws / "CLAUDE.md").read_text()
+
+
 def test_the_brief_says_what_the_run_is_judged_on(tmp_path):
     """The first pilot was told what it could do and not what any of it was for, so it
     maximised the only number that grew: reward summed over the run, which counts one
@@ -334,6 +400,10 @@ def test_a_run_without_a_stint_is_one_session(tmp_path, monkeypatch):
 
     report, opened = go(stint=0)
     assert report.sessions == 1 and len(opened) == 1
+    # Spelled out rather than left to the actuator's own default, which is now the
+    # opposite of what this run asked for. A flag passed only on one side of a
+    # default is how the launcher and the daemon come to disagree in silence.
+    assert "--same-world" in opened[0], "the world rule rode on a default"
 
     # `go` carries on the same workspace, so this is a second launch of the run the
     # first one started — which is the whole reason the two numbers below differ.

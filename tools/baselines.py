@@ -69,9 +69,16 @@ REPLAY_ACHIEVEMENTS = [
 ]
 
 
-def rollout(variant: str, seed: int, policy: str, budget: int, trial: int) -> dict:
-    """One run: a shared budget across lives, ending when the budget does."""
-    game = CraftaxGame(variant, seed=seed)
+def rollout(variant: str, seed: int, policy: str, budget: int, trial: int,
+            fresh_world: bool = True) -> dict:
+    """One run: a shared budget across lives, ending when the budget does.
+
+    `fresh_world` is named rather than left to the engine, and it defaults to what
+    the arms play. A floor measured under one rule does not bound a run played under
+    the other: replaying one world lets a policy — or an agent — carry a route
+    across deaths, and a new world every life takes that away.
+    """
+    game = CraftaxGame(variant, seed=seed, fresh_world=fresh_world)
     if policy == "route":
         played = route.run(game, budget)
         used = played.used
@@ -101,6 +108,8 @@ def rollout(variant: str, seed: int, policy: str, budget: int, trial: int) -> di
         "seed": seed,
         "policy": policy,
         "trial": trial,
+        # Recorded, because a floor from one regime says nothing about the other.
+        "fresh_world": fresh_world,
         "actions_used": used,
         "max_score": game.max_score,
         "best_episode": best,

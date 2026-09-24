@@ -52,8 +52,12 @@ def test_a_prefix_replays_bit_exactly_after_a_restart():
     back to where it was. That is only true if the key for step t is a function of
     t and the seed — a key driven by the global action count would look just as
     deterministic and quietly break this.
+
+    `fresh_world=False` is named here rather than taken from the default, which is
+    now the opposite. Walking back is a property of the replayed world, and this
+    test is what says the harness still offers one at all.
     """
-    game = CraftaxGame("craftax", seed=0)
+    game = CraftaxGame("craftax", seed=0, fresh_world=False)
     drive(game, PREFIX)
     once, unlocked = digest(game), list(game.episodes[-1].achievements)
 
@@ -62,9 +66,9 @@ def test_a_prefix_replays_bit_exactly_after_a_restart():
     assert digest(game) == once, "replaying the same prefix diverged"
     assert game.episodes[-1].achievements == unlocked
 
-    fresh = CraftaxGame("craftax", seed=0)
-    drive(fresh, PREFIX)
-    assert digest(fresh) == once, "a new game on the same seed diverged"
+    rebuilt = CraftaxGame("craftax", seed=0, fresh_world=False)
+    drive(rebuilt, PREFIX)
+    assert digest(rebuilt) == once, "a new game on the same seed diverged"
 
 
 def test_the_seed_chooses_the_world():
@@ -73,20 +77,25 @@ def test_the_seed_chooses_the_world():
     assert digest(CraftaxGame("craftax", seed=0)) == digest(a)
 
 
-def test_a_new_world_is_dealt_only_when_asked():
-    """Same world by default: what the session learned about this map still applies,
-    which is what makes a second life worth anything."""
-    same = CraftaxGame("craftax", seed=0)
-    start = digest(same)
+def test_a_new_world_is_dealt_unless_the_same_one_is_asked_for():
+    """A new world each life by default, since 2026-09-24.
+
+    Replaying one world turns a long budget into a recording: an agent finds a good
+    life once, writes it down and re-executes it, and the actions after that are not
+    play. Both settings still work and the first life is the same world either way —
+    the seed picks it, and `fresh_world` only decides what the *next* life gets.
+    """
+    fresh = CraftaxGame("craftax", seed=0)
+    start = digest(fresh)
+    drive(fresh, PREFIX)
+    fresh.restart()
+    assert digest(fresh) != start, "the default replayed the world"
+
+    same = CraftaxGame("craftax", seed=0, fresh_world=False)
+    assert digest(same) == start, "the first life differed before anyone died"
     drive(same, PREFIX)
     same.restart()
     assert digest(same) == start
-
-    fresh = CraftaxGame("craftax", seed=0, fresh_world=True)
-    assert digest(fresh) == start
-    drive(fresh, PREFIX)
-    fresh.restart()
-    assert digest(fresh) != start
 
 
 # --------------------------------------------------------------------------- #

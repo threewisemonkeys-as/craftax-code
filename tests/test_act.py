@@ -40,6 +40,10 @@ CHEAP = ("symbolic",)
 def rig(tmp_path):
     """A workspace and, somewhere else entirely, the environment's directory."""
 
+    # `fresh_world=False` deliberately, though the harness default became True on
+    # 2026-09-24: most of what these tests check is replay and rebuild, which are
+    # statements about a world that comes back the same way. The default path has
+    # its own test below.
     def build(variant="craftax", budget=0, obs=("pixels",), seed=0, fresh_world=False):
         ws = tmp_path / "ws"
         ws.mkdir(exist_ok=True)
@@ -142,6 +146,27 @@ def test_a_death_stops_the_batch_and_the_next_life_begins(rig):
     assert (ws / "frames" / "000226-restart.png").read_bytes() == start, (
         "the next life did not begin in the same world"
     )
+
+
+def test_a_fresh_world_run_wakes_up_somewhere_else_and_says_so(rig):
+    """The default since 2026-09-24, so this is the path most runs now take.
+
+    Two things have to move together or a session is misled about the only thing it
+    can carry between lives: the world the restart frame shows, and the sentence the
+    log's own preamble uses to describe a restart. The preamble is not decoration —
+    the brief tells every session to read it before anything else.
+    """
+    session, ws, _ = rig(fresh_world=True)
+    start = (ws / "frames" / "000000.png").read_bytes()
+    run(session, ["noop"] * STARVE)
+
+    assert session.state.deaths == 1 and session.state.lives == 2
+    restart = ws / "frames" / f"{session.state.actions_used:06d}-restart.png"
+    assert restart.read_bytes() != start, "a fresh-world death replayed the same world"
+
+    preamble = (ws / act.LOG).read_text()
+    assert "the next one began in a new world" in preamble
+    assert "in the same world" not in preamble, "the log still promises one world"
 
 
 def test_a_life_ending_costs_only_what_was_spent(rig):
@@ -507,6 +532,42 @@ def test_a_rebuilt_run_is_the_same_run(tmp_path):
         assert json.loads((env_dir / act.RESULT).read_text())["history"] == (
             was["history"] + ["down", "down"]
         )
+    finally:
+        subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
+
+
+def test_a_rebuilt_fresh_world_run_lands_in_the_same_sequence_of_worlds(tmp_path):
+    """The rebuild risk the other resume tests cannot see.
+
+    A life's world is `fold_in(world_root, len(episodes))`, so under the old default
+    the index was multiplied by nothing and every life was world zero — which is why
+    the rebuild tests above pass without ever exercising it. They also die zero
+    times. Under the default since 2026-09-24 the index is load-bearing: a rebuild
+    that replayed the deaths but not their ordering would resume a 30,000-action run
+    into a different world and nothing would say so.
+    """
+    import numpy as np
+
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    common = ("--variant", "classic", "--env-dir", str(env_dir), "--obs", "symbolic",
+              "--budget", "400", "--fresh-world")
+    try:
+        act_cli(ws, "init", *common)
+        act_cli(ws, "do", "noop*400")  # stops early: thirst ends life one
+        act_cli(ws, "do", "left", "left")  # and these are played in life two
+        was = json.loads((env_dir / act.RESULT).read_text())
+        assert was["deaths"] == 1 and was["lives"] == 2, "the life did not end"
+        last = was["actions_used"]
+
+        act_cli(ws, "init", *common, "--resume")
+        now = json.loads((env_dir / act.RESULT).read_text())
+        assert np.array_equal(
+            np.load(ws / "symbolic" / f"{last:06d}.npy"),
+            np.load(ws / "symbolic" / f"{last:06d}-resume.npy"),
+        ), "the second life was rebuilt in a different world"
+        assert now["history"] == was["history"]
+        assert now["deaths"] == was["deaths"] and now["lives"] == was["lives"]
     finally:
         subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
 

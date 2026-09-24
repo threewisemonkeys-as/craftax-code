@@ -227,7 +227,7 @@ class CraftaxGame:
         variant: str = "craftax",
         seed: int = 0,
         obs: tuple[str, ...] = DEFAULT_CHANNELS,
-        fresh_world: bool = False,
+        fresh_world: bool = True,
     ) -> None:
         if variant not in VARIANTS:
             raise GameError(f"{variant!r} is not one of {VARIANTS}")
@@ -338,10 +338,11 @@ class CraftaxGame:
     def restart(self) -> None:
         """End this life and begin the next.
 
-        By default the next one is the *same world*: what the session learned about
-        this map still applies, and the same actions from the start replay the same
-        frames. `fresh_world=True` deals a new one instead, which is the
-        generalisation setting and not the default.
+        By default the next one is a *new world*: `fresh_world=True` rolls the world
+        key on by one life, so nothing about this map carries over and a saved
+        opening is worth nothing. `fresh_world=False` replays the same one instead —
+        the same actions from the start reproduce the same frames, which is what
+        lets a session record a good life and re-execute it rather than play.
         """
         self.episodes[-1].ended = self.episodes[-1].ended or "restart"
         self._begin()

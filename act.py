@@ -99,7 +99,7 @@ class RunState(BaseModel):
     variant: str = "craftax"
     seed: int = 0
     obs: list[str] = list(DEFAULT_CHANNELS)
-    fresh_world: bool = False
+    fresh_world: bool = True
     budget: int = 0
     env_dir: str = ""
 
@@ -268,7 +268,8 @@ def preamble(state: RunState, tokens: tuple[str, ...], channels: dict[str, str])
         f"#   later.\n"
         f"{stint_note(state)}"
         f"# [event] lines are things the actuator did that you did not ask for:\n"
-        f"#   life over — this life ended and the next one began in the same world.\n"
+        f"#   life over — this life ended and the next one began "
+        f"{'in a new world' if state.fresh_world else 'in the same world'}.\n"
         f"#     The actions already spent stay spent. That block holds two\n"
         f"#     observations: first the one the action produced, which is the state\n"
         f"#     the life ended in, and then a `-restart` one, the state the next\n"
@@ -888,8 +889,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         "--stint", str(args.stint),
         "--obs", *args.obs,
     ]
-    if args.fresh_world:
-        argv.append("--fresh-world")
+    # Spelled out rather than appended only when true. The default is fresh, and a
+    # flag that is passed only on one side of a default leaves the daemon deciding
+    # the world rule for itself — which is how the two ends come apart when a
+    # default moves. Say it either way and the daemon's own default never applies.
+    argv.append("--fresh-world" if args.fresh_world else "--same-world")
     if args.resume:
         argv.append("--resume")
     env_dir = Path(args.env_dir or tempfile.mkdtemp(prefix="act-env-"))
@@ -942,8 +946,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"default {DEFAULT_BUDGET} by variant")
         p.add_argument("--obs", nargs="+", choices=CHANNELS, default=list(DEFAULT_CHANNELS),
                        help="which of the package's own observations to write")
-        p.add_argument("--fresh-world", action="store_true",
-                       help="deal a new world on each life instead of replaying this one")
+        world = p.add_mutually_exclusive_group()
+        world.add_argument("--fresh-world", dest="fresh_world", action="store_true",
+                           help="deal a new world on each life (the default)")
+        world.add_argument("--same-world", dest="fresh_world", action="store_false",
+                           help="replay one world every life, so a route or a saved "
+                                "opening carries across deaths")
+        p.set_defaults(fresh_world=True)
         p.add_argument("--stint", type=int, default=0,
                        help="actions one session may play before another takes over "
                             "(0: the whole budget, in one session)")

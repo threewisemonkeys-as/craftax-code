@@ -236,12 +236,18 @@ def child_env(api_key: str | None) -> dict[str, str]:
     return env
 
 
-def brief(channels: list[str]) -> str:
+def brief(channels: list[str], fresh_world: bool = True) -> str:
     """GAME.md with its first paragraph filled in from what this run gives out.
 
     Generated rather than written, so a run with a different `--obs` cannot end up
     with a brief describing a channel it does not have. The wording says where the
     files go and nothing about what is in them.
+
+    What a death costs is generated for the same reason, and it is not cosmetic. A
+    run that replays one world rewards remembering it — a route, a map, a saved
+    opening — and a run that deals a new one punishes exactly that. A brief that
+    named the wrong one would be teaching the agent something false about the only
+    thing it can carry between lives.
     """
     said = [SAID[c] for c in CHANNELS if c in channels]
     if len(said) == 1:
@@ -252,8 +258,17 @@ def brief(channels: list[str]) -> str:
             + ", ".join(said[:-1])
             + f", and {said[-1]}."
         )
-    return (REPO / "GAME.md").read_text().replace(
-        "{observations}", f"{body} That is the whole of what you are told."
+    # Both read into the sentence that follows them in GAME.md, which continues
+    # "and the run carries on spending the same budget".
+    death = (
+        "If you die a new world is dealt"
+        if fresh_world else
+        "If you die the world starts again from its beginning"
+    )
+    return (
+        (REPO / "GAME.md").read_text()
+        .replace("{observations}", f"{body} That is the whole of what you are told.")
+        .replace("{death}", death)
     )
 
 
@@ -299,7 +314,8 @@ def bin_dir(root: Path) -> Path:
     return where
 
 
-def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
+def make_workspace(root: Path, label: str, channels: list[str],
+                   fresh_world: bool = True) -> Path:
     """A workspace holds the prompt, a way to act, a way to look, and nothing else.
 
     The brief says what this environment is; PROMPT.md says how to play and names no
@@ -322,7 +338,8 @@ def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
         )
     ws = root / label
     ws.mkdir(parents=True)
-    (ws / "CLAUDE.md").write_text(brief(channels) + "\n" + (REPO / "PROMPT.md").read_text())
+    (ws / "CLAUDE.md").write_text(
+        brief(channels, fresh_world) + "\n" + (REPO / "PROMPT.md").read_text())
     neutral = bin_dir(root)
     for name, interpreter, script in (
         ("act", neutral / "env-python", f' "{neutral / "actuator.py"}"'),
@@ -347,8 +364,15 @@ def refresh_brief(ws: Path) -> None:
     workspace is touched: notes.md and the helper scripts are the session's, and
     CLAUDE.md is the harness's.
     """
-    channels = list(json.loads((ws / "state.json").read_text())["obs"])
-    (ws / "CLAUDE.md").write_text(brief(channels) + "\n" + (REPO / "PROMPT.md").read_text())
+    state = json.loads((ws / "state.json").read_text())
+    channels = list(state["obs"])
+    (ws / "CLAUDE.md").write_text(
+        # `False` rather than the current default on purpose: a state.json without
+        # the key was written before the default moved to fresh, and every run from
+        # that era replayed one world. Guessing the new default here would rewrite
+        # an old run's brief into a lie halfway through it.
+        brief(channels, bool(state.get("fresh_world", False)))
+        + "\n" + (REPO / "PROMPT.md").read_text())
 
 
 def credential_life(path: Path) -> tuple[float, float]:
@@ -750,7 +774,7 @@ async def play(
             refresh_brief(ws)  # before `act init --again`, which clears state.json
             print(f"[{label}] replaying with the last session's notes", flush=True)
         else:
-            ws, opening = make_workspace(root, label, args.obs), "fresh"
+            ws, opening = make_workspace(root, label, args.obs, args.fresh_world), "fresh"
 
         # On a kept workspace the channels are the record's, not the arguments' —
         # `act --resume` ignores `--obs` for the same reason, and a report that
@@ -792,8 +816,9 @@ async def play(
                 "--obs", *args.obs,
                 "--env-dir", str(env_dir),
             ]
-            if args.fresh_world:
-                out.append("--fresh-world")
+            # Always spelled out — see the daemon's argv in act.py for why a flag
+            # that rides on a default is a flag waiting to disagree with itself.
+            out.append("--fresh-world" if args.fresh_world else "--same-world")
             # Only the first session of a launch decides how the world begins. Every
             # session after it resumes, whatever the first one did — including a
             # fresh run, whose second session picks up the state its first left.
@@ -1141,8 +1166,14 @@ async def main() -> int:
                              "min. A rate limit is a window, not an error")
     parser.add_argument("--obs", nargs="+", choices=CHANNELS, default=list(DEFAULT_CHANNELS),
                         help="which of the package's own observations the sessions get")
-    parser.add_argument("--fresh-world", action="store_true",
-                        help="deal a new world on each life instead of replaying this one")
+    world = parser.add_mutually_exclusive_group()
+    world.add_argument("--fresh-world", dest="fresh_world", action="store_true",
+                       help="deal a new world on each life (the default)")
+    world.add_argument("--same-world", dest="fresh_world", action="store_false",
+                       help="replay one world every life. A deterministic world "
+                            "rewards recording a good life and re-executing it, so "
+                            "much of the budget stops being play")
+    parser.set_defaults(fresh_world=True)
     parser.add_argument("--agent", default="claude", choices=sorted(AGENTS))
     fencing = parser.add_mutually_exclusive_group()
     fencing.add_argument(
