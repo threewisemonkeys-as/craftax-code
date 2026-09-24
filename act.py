@@ -143,8 +143,14 @@ class RunState(BaseModel):
     max_level: int = 0
     deaths: int = 0
 
+    # Withheld from the copy that sits in the workspace. `variant` is here for a
+    # different reason than the rest: it is not a score but a name — the string
+    # "craftax", in a file beside the log the session is told to read. A brief that
+    # says "a game you have never seen before" and a state file that names it are
+    # not withholding anything. What the run *is* lives in the record beside the
+    # environment, which is also where `pick_up` reads it back from.
     PRIVATE: ClassVar[set[str]] = {
-        "env_dir", "episodes", "achievements", "score", "max_score",
+        "env_dir", "variant", "episodes", "achievements", "score", "max_score",
         "unique_cells", "max_level", "deaths", "reward",
     }
 
@@ -726,16 +732,27 @@ def pick_up(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
     """A run that is already part-played, rebuilt from its own record.
 
     What the run *is* — the variant, the seed, the channels, whether each life gets a
-    fresh world — comes from the record and never from the arguments. Those four
-    define the world the recorded history is a history of, and a launcher that
-    disagreed with them would rebuild a different world and call it the same run.
-    The budget and the stint are the launcher's to set, and are the only reason this
-    exists: a run is extended by resuming it with a larger budget.
+    fresh world — comes from **the record beside the environment** and never from the
+    arguments. Those four define the world the recorded history is a history of, and a
+    launcher that disagreed with them would rebuild a different world and call it the
+    same run.
+
+    From the record and not from `state.json`, because `state.json` sits in the
+    workspace and no longer carries the variant: it is the field that would tell a
+    session what it is playing. The budget and the stint are the launcher's to set,
+    and are the only reason this exists: a run is extended by resuming it with a
+    larger budget.
     """
-    saved = ws / STATE
-    if not saved.exists():
+    if not (ws / STATE).exists():
         raise ActError(f"{ws} holds no run to resume — there is no {STATE}")
-    was = json.loads(saved.read_text())
+    record = Path(env_dir, RESULT)
+    if not record.exists():
+        raise ActError(
+            f"{ws} holds a run but {record} does not — the record beside the "
+            f"environment is what says which world this is a run of, so a resume "
+            f"needs the --env-dir the run was played under"
+        )
+    was = json.loads(record.read_text())
     state = RunState(
         variant=was["variant"],
         seed=was["seed"],

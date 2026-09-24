@@ -244,6 +244,44 @@ def test_state_json_names_neither_the_achievements_nor_the_score(rig):
     assert "reward" not in on_disk
 
 
+def test_state_json_does_not_name_the_game(rig):
+    """`variant` is the string "craftax", in a file that sits beside the log the
+    session is told to read. Withholding the name from the brief and leaving it here
+    would be withholding nothing."""
+    session, ws, _ = rig()
+    run(session, CHOP)
+    body = (ws / act.STATE).read_text()
+    assert "variant" not in json.loads(body)
+    assert "craftax" not in body.lower()
+
+
+def test_nothing_the_actuator_writes_into_the_workspace_names_the_game(rig):
+    """Checked over the workspace rather than over the one file that was supposed to
+    hold the line. Only what the actuator writes: the `act` and `python` shims are
+    the launcher's, and carry the harness's own path."""
+    session, ws, _ = rig(obs=CHEAP)
+    run(session, CHOP)
+    run(session, ["noop"] * STARVE)  # through a death, which writes the restart block
+    for path in ws.rglob("*"):
+        if path.is_file() and path.suffix != ".png":
+            assert "craftax" not in path.read_text(errors="replace").lower(), path
+
+
+def test_a_resume_takes_the_world_from_the_record_not_the_workspace(rig, tmp_path):
+    """The variant has to come back from somewhere now that `state.json` has lost it,
+    and the record beside the environment is the only copy a session cannot reach."""
+    session, ws, env_dir = rig(budget=40)
+    run(session, CHOP)
+    session.state.save(ws)
+    session.state.record()
+    args = type("A", (), {"budget": 0, "stint": 0})()
+    assert act.pick_up(ws, args, env_dir).state.variant == "craftax"
+    # Without the record there is no resume, rather than a resume of the default world.
+    (env_dir / act.RESULT).unlink()
+    with pytest.raises(act.ActError, match="record beside the environment"):
+        act.pick_up(ws, args, env_dir)
+
+
 def test_the_log_says_nothing_about_the_observation(rig, monkeypatch):
     """No hash, no changed-pixel count, no summary — the path, and that is all.
 

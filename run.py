@@ -62,7 +62,13 @@ from craftax_game import CHANNELS, DEFAULT_CHANNELS, VARIANTS  # noqa: E402
 # Outside the repository on purpose. A workspace under it puts this harness's source,
 # its git history, the interpreter that can import the package and every sibling
 # session one `..` away.
-RUNS = Path(os.environ.get("CRAFTAX_RUNS") or Path.home() / "craftax-runs")
+#
+# Named for neither game, and shared with the NetHack harness, because a workspace's
+# own path is the one string a session cannot avoid reading: it is in `pwd`, in every
+# absolute path it writes and in the note every failed tool call appends. A root
+# called `craftax-runs` told each of the first five runs what it was playing before
+# it had played anything.
+RUNS = Path(os.environ.get("RUNS_ROOT") or Path.home() / "agent-runs")
 # The interpreter the workspace's `python` shim points at: numpy and Pillow, and
 # deliberately not the package. Built by tools/make_agent_venv.sh.
 AGENT_PYTHON = REPO / ".agent-venv" / "bin" / "python"
@@ -251,6 +257,48 @@ def brief(channels: list[str]) -> str:
     )
 
 
+BIN = ".bin"
+
+
+def bin_dir(root: Path) -> Path:
+    """Neutral names for the interpreters and the actuator.
+
+    A shim is a file in the workspace, and the first thing a curious session does
+    with a command it has been handed is read it. Written directly, `act` says
+    `exec "<...>/cc_craftax/craftax-code/.env-venv/bin/python" "<...>/craftax-code/act.py"`,
+    which names the game twice before the session has played anything — and the run
+    that prompted this read it at its nineteenth command. Through these the shim says
+    `<launch>/.bin/env-python <launch>/.bin/actuator.py`.
+
+    Launching the daemon through them closes the same leak in `ps`: `/proc` is
+    readable inside the fence, so a session that lists processes would otherwise find
+    the harness's path on the actuator's own command line.
+
+    A fence one step deep, not a wall. Reading *these* — `cat .bin/env-python`, or
+    `ls -l` on the directory — gets you the harness's path, and a session that reads
+    the actuator's source finds the game named in its first lines. Both are
+    *reaching* rather than noticing, and the audit grades them. What this closes is
+    the accident: the session that learns what it is playing from a path it printed
+    for some other reason.
+
+    The interpreters are wrappers rather than symlinks, and that is not a style
+    choice. A venv's `python` finds its own site-packages from the directory it was
+    invoked through, so a symlink to one lands outside the venv and imports nothing.
+    The actuator is a symlink, because Python resolves a script's symlink before
+    deciding what is on `sys.path`.
+    """
+    where = root / BIN
+    where.mkdir(parents=True, exist_ok=True)
+    for name, target in (("env-python", Path(sys.executable)), ("python", AGENT_PYTHON)):
+        (where / name).write_text(f'#!/bin/sh\nexec "{target}" "$@"\n')
+        (where / name).chmod(0o755)
+    link = where / "actuator.py"
+    if not (link.is_symlink() and link.resolve() == (REPO / "act.py").resolve()):
+        link.unlink(missing_ok=True)
+        link.symlink_to(REPO / "act.py")
+    return where
+
+
 def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
     """A workspace holds the prompt, a way to act, a way to look, and nothing else.
 
@@ -263,6 +311,9 @@ def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
     interpreter on this machine has neither numpy nor Pillow, so without it the run
     is unplayable. It points at an interpreter that cannot import the package —
     handing over the harness's own would hand over the world generator.
+
+    Both shims run through the launch's `.bin`, so that reading one says nothing
+    about what is being played. See `bin_dir`.
     """
     if not AGENT_PYTHON.exists():
         raise SystemExit(
@@ -272,9 +323,10 @@ def make_workspace(root: Path, label: str, channels: list[str]) -> Path:
     ws = root / label
     ws.mkdir(parents=True)
     (ws / "CLAUDE.md").write_text(brief(channels) + "\n" + (REPO / "PROMPT.md").read_text())
+    neutral = bin_dir(root)
     for name, interpreter, script in (
-        ("act", sys.executable, f' "{REPO / "act.py"}"'),
-        ("python", AGENT_PYTHON, ""),
+        ("act", neutral / "env-python", f' "{neutral / "actuator.py"}"'),
+        ("python", neutral / "python", ""),
     ):
         shim = ws / name
         shim.write_text(f'#!/bin/sh\nexec "{interpreter}"{script} "$@"\n')
@@ -427,6 +479,10 @@ def fenced_argv(agent, argv: list[str], ws: Path, home: Path) -> list[str]:
         Path("/run/systemd/resolve"),
         Path(sys.base_prefix),  # the real interpreter behind both venvs, and its stdlib
         shipped,  # the CLI's own binary and the tools it ships beside it
+        # The neutral names the workspace's shims are written in. Granted as well as
+        # `act.py` below, not instead of it: `actuator.py` is a symlink and Landlock
+        # checks where a symlink lands, not what it is called.
+        ws.parent / BIN,
         REPO / "act.py",  # the two files the workspace's `act` shim runs
         REPO / "craftax_game.py",
         REPO / ".env-venv" / "bin",
@@ -444,9 +500,14 @@ def fenced_argv(agent, argv: list[str], ws: Path, home: Path) -> list[str]:
 
 
 async def act(ws: Path, *args: str) -> str:
+    """Run one actuator command in a workspace, as the launcher rather than as the
+    session. Through the launch's `.bin` like the session's own shim, because this is
+    what starts the daemon and `/proc` is readable inside the fence: launched by its
+    real path, the actuator would name the game on its own command line."""
+    neutral = bin_dir(ws.parent)
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(REPO / "act.py"),
+        str(neutral / "env-python"),
+        str(neutral / "actuator.py"),
         *args,
         cwd=ws,
         stdout=asyncio.subprocess.PIPE,

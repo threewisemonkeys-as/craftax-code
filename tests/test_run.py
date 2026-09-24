@@ -742,11 +742,19 @@ def test_a_turn_is_a_response_and_not_an_event():
 
 
 def fenced(argv: list[str], ws: Path) -> subprocess.CompletedProcess:
-    """Run `argv` under exactly the fence a codex session of this launch would get."""
+    """Run `argv` under exactly the fence a codex session of this launch would get.
+
+    The launch's `.bin` is staged first because every real fence stands inside a launch
+    that has one, and the allowlist names it: an allowlisted path that does not exist is
+    an error rather than something the fence steps over. Without it the fence never
+    starts — which a `reads()` assertion cannot tell apart from a file it could not read,
+    so the tests below would go green on a fence that was never applied.
+    """
     import fence
 
     if not fence.supported():
         pytest.skip("this kernel has no Landlock, so there is no fence to test")
+    run.bin_dir(ws.parent)
     full = run.fenced_argv(AGENTS["codex"], ["codex"], ws, ws)
     wrapped = full[: full.index("--")] + ["--", *argv]
     return subprocess.run(wrapped, cwd=ws, capture_output=True, text=True, timeout=60)
@@ -774,6 +782,11 @@ def test_a_fenced_session_cannot_read_what_it_is_meant_to_be_playing_for(tmp_pat
     # directory always exists, and a session that cannot list it cannot walk it.
     listed = fenced(["ls", str(Path.home())], ws)
     assert listed.returncode != 0, "the operator's home is walkable"
+    # The actuator's own interpreter, which the launch's `.bin` now puts within reach
+    # under a name that says nothing. Reaching it is the whole of what 524HW did at its
+    # nineteenth tool call; what it got back was ModuleNotFoundError, and this is that.
+    blocked = fenced([str(run.bin_dir(ws.parent) / "env-python"), "-c", "import craftax"], ws)
+    assert blocked.returncode != 0, "the actuator's interpreter imports the package"
 
 
 def test_the_fence_keeps_everything_a_session_plays_with(tmp_path):
