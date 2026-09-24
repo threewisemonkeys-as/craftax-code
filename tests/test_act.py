@@ -761,3 +761,50 @@ def test_a_rebuild_restores_the_schedule_from_the_record(tmp_path):
         assert now["stint_end"] == 8 and now["pause_on"] == ["death", "reward"]
     finally:
         subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)
+
+
+def steps(env_dir):
+    return [json.loads(line) for line in (env_dir / act.STEPS).read_text().splitlines()]
+
+
+def test_every_action_gets_a_private_line_naming_its_frame_and_what_it_unlocked(rig):
+    session, ws, env_dir = rig()
+    run(session, CHOP)
+    rows = steps(env_dir)
+    assert [r["t"] for r in rows] == list(range(1, len(CHOP) + 1))
+    assert [r["action"] for r in rows] == CHOP
+    assert all((ws / r["after"]).exists() for r in rows)
+    wood = [r for r in rows if r["unlocks"]]
+    assert wood and wood[0]["unlocks"] == ["collect_wood"] and wood[0]["reward"] >= 1
+    assert "reward" in wood[0]["events"]
+    assert not (ws / act.STEPS).exists(), "the record is in the workspace"
+
+
+def test_the_action_that_ends_a_life_records_both_frames(rig):
+    session, ws, env_dir = rig()
+    run(session, ["noop"] * STARVE)
+    last = steps(env_dir)[-1]
+    assert last["t"] == 226 and not last["alive"] and "death" in last["events"]
+    assert last["after"] == "frames/000226.png"
+    assert last["restart"] == "frames/000226-restart.png" and last["life"] == 1
+    assert all(r["life"] == 1 and r["alive"] for r in steps(env_dir)[:-1])
+
+
+def test_a_rebuild_trims_the_record_to_the_run_it_rebuilt(tmp_path):
+    ws, env_dir = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    common = ("--variant", "classic", "--env-dir", str(env_dir), "--obs", "symbolic",
+              "--budget", "30")
+    try:
+        act_cli(ws, "init", *common)
+        act_cli(ws, "do", "noop*3")
+        with (env_dir / act.STEPS).open("a") as out:  # a line the record never saved
+            out.write(json.dumps({"t": 4, "action": "noop"}) + "\n")
+        act_cli(ws, "init", *common, "--resume")
+        assert [r["t"] for r in steps(env_dir)] == [1, 2, 3]
+        act_cli(ws, "do", "noop")
+        assert [r["t"] for r in steps(env_dir)] == [1, 2, 3, 4]
+        act_cli(ws, "init", *common, "--again")  # a new run starts a new record
+        assert not (env_dir / act.STEPS).exists()
+    finally:
+        subprocess.run([sys.executable, str(ROOT / "act.py"), "stop"], cwd=ws, timeout=60)

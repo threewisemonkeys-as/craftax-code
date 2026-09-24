@@ -39,6 +39,7 @@ import asyncio
 import json
 import os
 import secrets
+import shlex
 import shutil
 import sys
 import textwrap
@@ -154,7 +155,8 @@ BANKED = ("cost_usd", "input_tokens", "output_tokens",
 # whole run's. These are the fields the launcher counts for itself, so left alone they
 # described a 20,000-action run with the last launch's bill: $169 of the $532 it had
 # actually cost. A continued run picks them up from the report it is continuing.
-CARRIED = ("seconds", "turns", "tool_calls", "compactions", "sessions", *BANKED)
+CARRIED = ("seconds", "turns", "tool_calls", "compactions", "sessions",
+           "updates", "update_failures", "update_cost_usd", "update_seconds", *BANKED)
 
 
 class Report(BaseModel):
@@ -227,6 +229,14 @@ class Report(BaseModel):
     pause_min: int = 0
     summarise: bool = False
     summaries: int = 0
+    # The world-model arm: what ran at each pause, and what it cost. Kept apart from
+    # `cost_usd` on purpose — that is the agent's bill, and a learner's is a
+    # different thing that must never be summed into it silently.
+    pause_hook: str = ""
+    updates: int = 0
+    update_failures: int = 0
+    update_cost_usd: float = 0.0
+    update_seconds: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -277,7 +287,7 @@ def reflow(text: str) -> str:
     )
 
 
-def brief(channels: list[str], fresh_world: bool = True) -> str:
+def brief(channels: list[str], fresh_world: bool = True, model: bool = False) -> str:
     """GAME.md with its first paragraph filled in from what this run gives out.
 
     Generated rather than written, so a run with a different `--obs` cannot end up
@@ -310,10 +320,22 @@ def brief(channels: list[str], fresh_world: bool = True) -> str:
         (REPO / "GAME.md").read_text()
         .replace("{observations}", f"{body} That is the whole of what you are told.")
         .replace("{death}", death)
+        .replace("{model}\n\n", MODEL_NOTE + "\n\n" if model else "")
     )
 
 
 BIN = ".bin"
+# What the world-model arm is told about `model/`. Neutral on how the model is made
+# beyond "from your own play": a session told how it was fitted is being told what to
+# expect of it, and what it makes of the model is the thing being measured.
+MODEL_NOTE = (
+    "A model of this world is kept in `model/`, learned from nothing but your own "
+    "play and relearned from time to time as you play: `model/world.md` says how the "
+    "world behaves, and `model/perceive.py` turns an observation into a description. "
+    "`./perceive` runs it on the latest observation, or on the frames you name, oldest "
+    "first. Nothing in it was written by hand, so it can be wrong. `model/VERSION` "
+    "says when it last changed. Until the first time, there is no `model/`."
+)
 
 
 def bin_dir(root: Path) -> Path:
@@ -356,7 +378,7 @@ def bin_dir(root: Path) -> Path:
 
 
 def make_workspace(root: Path, label: str, channels: list[str],
-                   fresh_world: bool = True) -> Path:
+                   fresh_world: bool = True, model: bool = False) -> Path:
     """A workspace holds the prompt, a way to act, a way to look, and nothing else.
 
     The brief says what this environment is; PROMPT.md says how to play and names no
@@ -380,8 +402,10 @@ def make_workspace(root: Path, label: str, channels: list[str],
     ws = root / label
     ws.mkdir(parents=True)
     (ws / "CLAUDE.md").write_text(
-        brief(channels, fresh_world) + "\n" + (REPO / "PROMPT.md").read_text())
+        brief(channels, fresh_world, model) + "\n" + (REPO / "PROMPT.md").read_text())
     neutral = bin_dir(root)
+    if model:
+        model_tools(ws, root)
     for name, interpreter, script in (
         ("act", neutral / "env-python", f' "{neutral / "actuator.py"}"'),
         ("python", neutral / "python", ""),
@@ -390,6 +414,17 @@ def make_workspace(root: Path, label: str, channels: list[str],
         shim.write_text(f'#!/bin/sh\nexec "{interpreter}"{script} "$@"\n')
         shim.chmod(0o755)
     return ws
+
+
+def model_tools(ws: Path, root: Path) -> None:
+    """`./perceive`, for the world-model arm: the model's own reader, run under the
+    agent's interpreter. Copied into the launch's `.bin` rather than linked, so that
+    reading it shows a short script and not the harness's path."""
+    neutral = bin_dir(root)
+    shutil.copyfile(REPO / "tools" / "perceive.py", neutral / "perceive.py")
+    shim = ws / "perceive"
+    shim.write_text(f'#!/bin/sh\nexec "{neutral / "python"}" "{neutral / "perceive.py"}" "$@"\n')
+    shim.chmod(0o755)
 
 
 def refresh_brief(ws: Path) -> None:
@@ -412,7 +447,8 @@ def refresh_brief(ws: Path) -> None:
         # the key was written before the default moved to fresh, and every run from
         # that era replayed one world. Guessing the new default here would rewrite
         # an old run's brief into a lie halfway through it.
-        brief(channels, bool(state.get("fresh_world", False)))
+        # A world-model run is one whose workspace was given `./perceive`.
+        brief(channels, bool(state.get("fresh_world", False)), (ws / "perceive").exists())
         + "\n" + (REPO / "PROMPT.md").read_text())
 
 
@@ -785,6 +821,49 @@ async def hand_over(agent, args, ws: Path, home: Path, session_env: dict[str, st
               f"{' '.join(stderr.split())[-200:]}", flush=True)
 
 
+async def run_hook(args, ws: Path, env_dir: Path, root: Path, label: str,
+                   report: "Report") -> None:
+    """The world-model arm's pause: run `--pause-hook` and wait for it.
+
+    The hook is told where the run's private record is, where the workspace is, and
+    which pause this is; what it does there is its own business — the harness knows
+    nothing about how a model is learned. It writes a small JSON result, whose
+    `cost_usd` is banked apart from the agent's. Never fatal: a failed update leaves
+    the previous model where it was, and the run carries on.
+    """
+    record = json.loads((env_dir / RESULT).read_text())
+    k = len(record.get("pauses", []))
+    out = rig_dir(root) / "updates" / label
+    out.mkdir(parents=True, exist_ok=True)
+    result = out / f"{k:03d}.json"
+    argv = [*shlex.split(args.pause_hook), "--env-dir", str(env_dir),
+            "--workspace", str(ws), "--update", str(k), "--result", str(result)]
+    started = time.monotonic()
+    with (out / f"{k:03d}.log").open("w") as log:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.DEVNULL, stdout=log,
+            stderr=asyncio.subprocess.STDOUT)
+        code = await proc.wait()
+    seconds = time.monotonic() - started
+    try:
+        got = json.loads(result.read_text())
+    except (OSError, json.JSONDecodeError):
+        got = {}
+    cost = float(got.get("cost_usd") or 0.0)
+    report.updates += 1
+    report.update_failures += int(bool(code))
+    report.update_cost_usd += cost
+    report.update_seconds += seconds
+    line = {"update": k, "at": record.get("actions_used"), "exit": code,
+            "shipped": got.get("shipped"), "cost_usd": cost, "seconds": round(seconds, 1),
+            "events": (record.get("pauses") or [{}])[-1].get("events")}
+    with (rig_dir(root) / "updates" / f"{label}.jsonl").open("a") as log:
+        log.write(json.dumps(line) + "\n")
+    print(f"[{label}] update {k} at action {line['at']}: "
+          + (f"exit {code}" if code else "shipped" if got.get("shipped") else "nothing shipped")
+          + f", ${cost:.2f}, {seconds / 60:.1f} min", flush=True)
+
+
 def harvested_since(ws: Path) -> float:
     """The newest harvested item already folded into this run's stream.
 
@@ -847,6 +926,9 @@ async def play(
     # achievements unlocked, by name.
     env_dir = root / ".envs" / label
     async with limit:
+        if getattr(args, "pause_hook", "") and (args.carry_on or args.replay):
+            # Before the brief is refreshed, which reads the arm off the workspace.
+            model_tools(root / label, root)
         if args.carry_on:
             ws, opening = root / label, "resume"
             refresh_brief(ws)
@@ -857,7 +939,8 @@ async def play(
             refresh_brief(ws)  # before `act init --again`, which clears state.json
             print(f"[{label}] replaying with the last session's notes", flush=True)
         else:
-            ws, opening = make_workspace(root, label, args.obs, args.fresh_world), "fresh"
+            ws, opening = make_workspace(root, label, args.obs, args.fresh_world,
+                                         bool(getattr(args, "pause_hook", ""))), "fresh"
 
         # On a kept workspace the channels are the record's, not the arguments' —
         # `act --resume` ignores `--obs` for the same reason, and a report that
@@ -878,6 +961,7 @@ async def play(
                         pause_on=list(getattr(args, "pause_on", [])),
                         pause_min=getattr(args, "pause_min", 0),
                         summarise=getattr(args, "summarise", False),
+                        pause_hook=getattr(args, "pause_hook", "") or "",
                         compactions=int(was["compactions"]))
 
         def briefed(n: int) -> str:
@@ -985,10 +1069,22 @@ async def play(
                         print(f"[{label}] session {n} {why}", flush=True)
 
                 state = json.loads((ws / "state.json").read_text())
-                if (getattr(args, "summarise", False) and not state["terminal"] and state["stint"]
-                        and state["actions_used"] >= state["stint_end"]
-                        and state["actions_used"] > before):
-                    await hand_over(agent, args, ws, home, session_env, report, label)
+                paused = (not state["terminal"] and state.get("stint")
+                          and state["actions_used"] >= state.get("stint_end", 0)
+                          and state["actions_used"] > before)
+                summarising = paused and getattr(args, "summarise", False)
+                hooked = paused and getattr(args, "pause_hook", "")
+                if summarising or hooked:
+                    # Side by side: the summary is written in the old conversation
+                    # while the hook works outside it, and the next session starts
+                    # only when both are done, so it finds both.
+                    await asyncio.gather(
+                        *([hand_over(agent, args, ws, home, session_env, report, label)]
+                          if summarising else []),
+                        *([run_hook(args, ws, env_dir, root, label, report)]
+                          if hooked else []),
+                    )
+                if summarising:
                     watermark = harvest(agent, home, ws, report, watermark)
                     for field in BANKED:
                         banked[field] += getattr(report, field)
@@ -1285,6 +1381,12 @@ async def main() -> int:
         help="B2: at each handover, ask the session that is ending to summarise "
              "into notes.md, in its own conversation, before the next one starts",
     )
+    parser.add_argument(
+        "--pause-hook", default="",
+        help="the world-model arm: a command run at every pause, with --env-dir, "
+             "--workspace, --update and --result appended. The next session waits "
+             "for it. The workspace gets `./perceive` and the brief says `model/` exists",
+    )
     parser.add_argument("--agent", default="claude", choices=sorted(AGENTS))
     fencing = parser.add_mutually_exclusive_group()
     fencing.add_argument(
@@ -1306,6 +1408,8 @@ async def main() -> int:
     args = parser.parse_args()
     if args.pause_on and not args.stint:
         parser.error("--pause-on needs --stint, which is the cap on a session")
+    if args.pause_hook and not args.pause_on:
+        parser.error("--pause-hook runs at pauses; add --pause-on")
     if args.summarise and args.agent != "claude":
         parser.error("--summarise resumes the ending conversation, which only the "
                      "claude adapter does so far")

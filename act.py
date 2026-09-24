@@ -60,6 +60,11 @@ SOCKET = ".act.sock"
 # is the answer to the game being played.
 DAEMON_LOG = "daemon.log"
 RESULT = "result.json"
+# One line per action, beside result.json and for the same reason: it names what each
+# action unlocked. It is what an online learner reads the run from (the frames are in
+# the workspace, the record of what happened on each action is here), so a learner
+# never has to rebuild the world to find out where the rewards and deaths were.
+STEPS = "steps.jsonl"
 SEP = "=" * 80
 
 # Random dies every ~250 actions and unions four achievements; a route to iron is a
@@ -584,7 +589,12 @@ class Session:
         """
         state = self.state
         deepest = self.game.max_level
+        life, had = state.lives, len(self.game.episodes[-1].achievements)
         reward, alive = self.game.play(token)
+        unlocked = self.game.episodes[-1].achievements[had:]
+        world = self.game.state()
+        health = float(world.player_health)
+        level = int(world.player_level) if hasattr(world, "player_level") else 0
 
         state.actions_used += 1
         state.reward += reward
@@ -599,7 +609,7 @@ class Session:
         body = [self.seen(produced)]
         self.last = produced
 
-        stop = None
+        stop, restarted = None, {}
         match ending(alive, state.actions_left):
             case "restart":
                 # The life ended and the run carries on into the next one. Two
@@ -620,11 +630,21 @@ class Session:
 
         # A rebuild replays the history with no stint and restores the schedule
         # from the record afterwards, so the events are only read when it is live.
-        if not self.replaying and not state.terminal:
+        if not self.replaying:
             events = (["reward"] if reward > 0 else []) \
                 + (["death"] if not alive else []) \
                 + (["level"] if self.game.max_level > deepest else [])
-            state.note_events(events)
+            segment = len(state.pauses)
+            paused = False if state.terminal else state.note_events(events)
+            self.step_record({
+                "t": state.actions_used, "action": token, "reward": round(reward, 4),
+                "alive": alive, "life": life, "level": level,
+                "max_level": self.game.max_level, "health": round(health, 3),
+                "unlocks": list(unlocked), "events": events,
+                "after": produced.get("pixels", ""),
+                "restart": restarted.get("pixels", "") if not alive else "",
+                "segment": segment, "paused": paused,
+            })
 
         # After the life and the run, because it is the weakest of the three: a
         # stint that ends on the same action the budget does is the run ending.
@@ -650,6 +670,13 @@ class Session:
         if stop and total - index:
             stop += f", {total - index} action(s) dropped"
         return stop
+
+    def step_record(self, row: dict) -> None:
+        """Append one action's line to the private per-action record."""
+        if not self.state.env_dir:
+            return
+        with Path(self.state.env_dir, STEPS).open("a") as out:
+            out.write(json.dumps(row) + "\n")
 
     def look(self, tag: str = "") -> dict[str, str]:
         """The observation this action produced — unless the action is being replayed.
@@ -777,6 +804,7 @@ def serve(args: argparse.Namespace) -> int:
 
 def start(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
     """A run from nothing: a new world, an empty log, action zero."""
+    Path(env_dir, STEPS).unlink(missing_ok=True)
     state = RunState(
         variant=args.variant,
         seed=args.seed,
@@ -791,6 +819,20 @@ def start(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
     # has a stint at all.
     state.begin_stint(args.stint)
     return Session.create(ws, state)
+
+
+def trim_steps(path: Path, upto: int) -> None:
+    """Keep the per-action record to the actions the rebuilt run has played.
+
+    A daemon killed between writing a line and saving the record would leave one
+    line too many, and a resume from an older record more than one: the rebuilt run
+    is the truth, and the next action it plays must be the next line.
+    """
+    if not path.exists():
+        return
+    kept = [line for line in path.read_text().splitlines()
+            if line.strip() and json.loads(line)["t"] <= upto]
+    path.write_text("".join(line + "\n" for line in kept))
 
 
 def pick_up(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
@@ -835,6 +877,7 @@ def pick_up(ws: Path, args: argparse.Namespace, env_dir: Path) -> Session:
     state.last_pause = int(was.get("last_pause", 0))
     state.pending = list(was.get("pending", []))
     state.pauses = list(was.get("pauses", []))
+    trim_steps(Path(env_dir, STEPS), state.actions_used)
     state.begin_stint(args.stint)
     grew = state.budget - was["budget"]
     session.announce(

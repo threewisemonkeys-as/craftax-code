@@ -19,6 +19,8 @@ is not. Nothing will tell you what earned it. What this run is judged on is the 
 single life in it — one life, taken as far as it goes — so a total across lives is not
 the thing to grow.
 
+{model}
+
 `./python` is a Python with numpy and Pillow, for reading the observations.
 
 The format of `logs.txt`, what each line of a block means, which actions you have and

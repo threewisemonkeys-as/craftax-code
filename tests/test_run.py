@@ -1073,3 +1073,91 @@ def test_fence_and_no_fence_cannot_both_be_asked_for():
     done = subprocess.run([sys.executable, str(ROOT / "run.py"), "--fence", "--no-fence",
                            "--dry-run"], capture_output=True, text=True, timeout=120)
     assert done.returncode != 0 and "not allowed with" in done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# The world-model arm
+# --------------------------------------------------------------------------- #
+
+
+def test_only_the_world_model_arm_is_told_about_the_model():
+    plain, told = run.brief(["pixels"]), run.brief(["pixels"], model=True)
+    assert "{model}" not in plain and "model/" not in plain and "\n\n\n" not in plain
+    assert "`./perceive`" in " ".join(told.split())
+    assert all(len(line) <= 86 for line in told.splitlines())
+
+
+def test_perceive_runs_the_model_on_the_latest_frame_or_the_ones_named(tmp_path):
+    ws = tmp_path / "W"
+    (ws / "frames").mkdir(parents=True)
+    for name in ("000000.png", "000001.png", "000001-restart.png"):
+        (ws / "frames" / name).write_bytes(b"")
+    tool = [str(run.AGENT_PYTHON), str(ROOT / "tools" / "perceive.py")]
+    said = subprocess.run(tool, cwd=ws, capture_output=True, text=True).stdout
+    assert "no model yet" in said
+    (ws / "model").mkdir()
+    (ws / "model" / "perceive.py").write_text(
+        "def perceive(h):\n    return '|'.join(p.rsplit('/', 1)[-1] for p in h)\n")
+    said = subprocess.run(tool, cwd=ws, capture_output=True, text=True).stdout
+    assert said.strip() == "000001-restart.png", "not the newest observation"
+    said = subprocess.run(tool + ["frames/000000.png", "frames/000001.png"], cwd=ws,
+                          capture_output=True, text=True).stdout
+    assert said.strip() == "000000.png|000001.png"
+
+
+def test_the_hook_runs_at_every_pause_and_its_cost_is_kept_apart(tmp_path, monkeypatch):
+    calls, ws = [], tmp_path / "W"
+    ws.mkdir()
+    (ws / "state.json").write_text(json.dumps(
+        {"obs": ["pixels"], "actions_used": 0, "terminal": False, "stint": 10,
+         "stint_end": 10}))
+    env_dir = tmp_path / ".envs" / "W"
+    env_dir.mkdir(parents=True)
+    record = {f: 0 for f in ("actions_used", "max_score", "best_episode", "best_episode_pct",
+                             "episodes_completed", "mean_episode", "mean_episode_pct",
+                             "score", "score_pct", "lives", "deaths", "unique_cells",
+                             "max_level")} | {"episode_scores": [], "achievements": [],
+                                              "pauses": []}
+
+    async def fake_act(where, *argv):
+        if argv[0] == "init":
+            played = json.loads((ws / "state.json").read_text())
+            played["actions_used"] += 10
+            played["stint_end"] = played["actions_used"]
+            played["terminal"] = played["actions_used"] >= 30
+            (ws / "state.json").write_text(json.dumps(played))
+            record["pauses"].append({"at": played["actions_used"], "events": ["reward"]})
+            record["actions_used"] = played["actions_used"]
+            (env_dir / "result.json").write_text(json.dumps(record))
+        return ""
+
+    async def fake_session(argv, where, env, report, agent):
+        calls.append(argv)
+        return "", 0
+
+    hook = tmp_path / "hook.py"
+    hook.write_text(
+        "import json, sys\n"
+        "a = dict(zip(sys.argv[1::2], sys.argv[2::2]))\n"
+        "open(a['--result'], 'w').write(json.dumps({'shipped': True, 'cost_usd': 1.5}))\n"
+        "open(a['--workspace'] + '/hooked', 'a').write(a['--update'] + '\\n')\n")
+    monkeypatch.setattr(run, "act", fake_act)
+    monkeypatch.setattr(run, "one_session", fake_session)
+    monkeypatch.setattr(run, "session_config", lambda r, label, agent=None: tmp_path / "cfg")
+    monkeypatch.setattr(run, "audit_session", lambda *a, **k: run.Audit())
+    args = type("A", (), {
+        "carry_on": str(tmp_path), "replay": None, "obs": ["pixels"], "budget": 30,
+        "stint": 10, "max_sessions": 10, "fresh_world": True, "agent": "claude",
+        "model": "m", "dry_run": False, "retries": 2, "idle_wait": 0,
+        "pause_on": ["reward"], "pause_min": 5, "summarise": False,
+        "pause_hook": f"{sys.executable} {hook}",
+    })()
+    report = asyncio.run(run.play("W", ("craftax", 0), tmp_path, args, {}, ["W"],
+                                  asyncio.Semaphore(1)))
+    assert (ws / "hooked").read_text().split() == ["1", "2"], "one update per pause"
+    assert report.updates == 2 and report.update_cost_usd == 3.0
+    assert report.cost_usd == 0.0, "the learner's bill was added to the agent's"
+    assert (ws / "perceive").exists() and "`./perceive`" in " ".join(
+        (ws / "CLAUDE.md").read_text().split())
+    lines = (tmp_path / ".rig" / "updates" / "W.jsonl").read_text().splitlines()
+    assert [json.loads(line)["update"] for line in lines] == [1, 2]
