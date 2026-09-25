@@ -672,10 +672,29 @@ def test_two_runs_of_one_cli_are_told_apart_by_their_model(tmp_path):
                                   "model": "claude-fable-5"}) + "\n" + stream.read_text())
 
     got = page([sol, astra, fable], tmp_path / "p.html")["runs"]
-    assert [r["arm"] for r in got] == ["claude fable-5", "codex gpt-5.6-sol",
-                                       "codex gpt-6-astra"]
+    # A run with no stint was one session, so its stint is its budget.
+    assert [r["arm"] for r in got] == ["claude fable-5 · stint 10 · same world",
+                                       "codex gpt-5.6-sol · stint 10 · same world",
+                                       "codex gpt-6-astra · stint 10 · same world"]
     # Fenced by the report where there is one, and by the adapter until then.
     assert [r["fenced"] for r in got] == [False, True, True]
+
+
+def test_two_runs_of_one_model_are_told_apart_by_stint_and_world(tmp_path):
+    """One model on one world, played as one session and as a chain of them, with a
+    new world after each death or the same one, is rows with the same CLI and model —
+    the stint and the world are the rest of the name."""
+    roots = []
+    for name, label, stint, fresh in (("A", "SSSSS", 3000, True),
+                                      ("B", "TTTTT", 30000, False)):
+        root = launch(tmp_path / name, label, "claude", played=2, budget=30000)
+        result = root / ".envs" / label / run.RESULT
+        result.write_text(json.dumps({**json.loads(result.read_text()),
+                                      "stint": stint, "fresh_world": fresh}))
+        roots.append(root)
+    got = page(roots, tmp_path / "p.html")["runs"]
+    assert [r["arm"].split(" · ", 1)[1] for r in got] == ["stint 3k · fresh world",
+                                                          "stint 30k · same world"]
 
 
 def test_the_arm_record_is_read_before_any_report_exists(tmp_path):
@@ -687,4 +706,4 @@ def test_the_arm_record_is_read_before_any_report_exists(tmp_path):
     (root / run.RIG / "arms" / "PPPPP.json").write_text(json.dumps(
         {"agent": "claude", "model": "claude-fable-5", "fenced": True}))
     one, = page([root], tmp_path / "p.html")["runs"]
-    assert one["arm"] == "claude fable-5" and one["fenced"] is True
+    assert one["arm"] == "claude fable-5 · stint 10 · same world" and one["fenced"] is True

@@ -233,7 +233,7 @@ function prefetch(i) {
    died different numbers of times — our seven-life pilot sums to 224 of 226 where
    its best life is 40.
 
-   The x axis is logarithmic: the runs span 766 steps to 23,225. The y axis is the
+   The x axis is linear in steps, 0 to the longest run. The y axis is the
    whole 226, un-zoomed, because that is the finding — every published number and
    every one of our lives sits in the bottom fifth, and one person went to the top. */
 const MAX = 226;
@@ -262,17 +262,18 @@ function drawChart() {
      arms does not rescale the axis under the comparison. */
   const ends = DATA.runs.map((r) => (r.curve || []).length ? r.curve[r.curve.length - 1][0] : 0);
   const top = Math.max(3000, ...runs.map((r) => r.steps), ...ends);
-  const x = (step) => pad.l + (Math.log10(Math.max(1, step)) / Math.log10(top)) * (w - pad.l - pad.r);
+  const x = (step) => pad.l + (step / top) * (w - pad.l - pad.r);
   const y = (score) => h - pad.b - (score / MAX) * (h - pad.t - pad.b);
   g.clearRect(0, 0, w, h);
 
   const line = ink("--line"), soft = ink("--ink-3"), body = ink("--ink-2");
   g.font = "10px ui-monospace, monospace";
 
-  /* Grid: powers of ten across, twenty points of the 226 up. */
+  /* Grid: about six even steps across, twenty points of the 226 up. */
   g.strokeStyle = line; g.fillStyle = soft; g.lineWidth = 1;
-  for (let p = 2; Math.pow(10, p) <= top; p++) {
-    const at = Math.pow(10, p);
+  const raw = top / 6, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const tick = mag * ([1, 2, 5, 10].find((m) => m * mag >= raw));
+  for (let at = tick; at <= top; at += tick) {
     g.beginPath(); g.moveTo(x(at), pad.t); g.lineTo(x(at), h - pad.b); g.stroke();
     g.textAlign = "center";
     g.fillText(at >= 1000 ? at / 1000 + "k" : String(at), x(at), h - pad.b + 14);

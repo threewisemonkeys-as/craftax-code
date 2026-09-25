@@ -63,7 +63,6 @@ import argparse
 import base64
 import io
 import json
-import math
 import os
 import re
 import sys
@@ -423,7 +422,7 @@ def best_curve(rewards, ends) -> list[float]:
 
 
 def thin(curve: list[float], points: int = 320) -> list[list[float]]:
-    """Log-spaced (step, score) pairs — the runs span 766 to 23,225 steps.
+    """Evenly spaced (step, score) pairs, for the chart's linear step axis.
 
     Every point where the curve *moves* is kept whatever the spacing says: those are
     the achievements, and they are the whole shape of the line.
@@ -433,9 +432,13 @@ def thin(curve: list[float], points: int = 320) -> list[list[float]]:
     n = len(curve)
     wanted = {0, n - 1}
     wanted |= {i for i in range(1, n) if curve[i] != curve[i - 1]}
-    lo, hi = math.log10(1), math.log10(n)
-    wanted |= {min(n - 1, int(10 ** (lo + (hi - lo) * k / points))) for k in range(points)}
+    wanted |= {min(n - 1, (n * k) // points) for k in range(points)}
     return [[i + 1, curve[i]] for i in sorted(wanted)]
+
+
+def thousands(n: int) -> str:
+    """3000 as `3k`, 2500 as `2.5k`, 800 as `800`."""
+    return f"{n / 1000:g}k" if n >= 1000 else str(n)
 
 
 def humans() -> list[dict]:
@@ -709,9 +712,14 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
             "agent": agent, "launch": root.name,
             # And which model, because a page can hold two runs of one CLI — and the
             # name a row goes by, which is the two together with the vendor's prefix
-            # dropped: `claude opus-5`, `codex gpt-6-astra`.
+            # dropped, then the stint its sessions played and whether a death dealt a
+            # new world: `claude opus-5 · stint 3k · fresh world`. Four runs of one
+            # model differ in nothing else the name could say. A run from before
+            # fresh worlds existed has no flag, and replayed its one world.
             "model": (model := model_of(root, label, agent, report)),
-            "arm": f"{agent} {model.removeprefix('claude-')}",
+            "arm": f"{agent} {model.removeprefix('claude-')} · stint "
+                   f"{thousands(record.get('stint') or record.get('budget') or 0)} · "
+                   f"{'fresh' if record.get('fresh_world') else 'same'} world",
             # Whether the sessions ran inside the filesystem fence — no longer a fact
             # about the CLI alone, since a Claude run can be launched with `--fence`.
             "fenced": fenced_of(root, label, agent, report),
