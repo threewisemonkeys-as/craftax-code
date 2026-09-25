@@ -20,12 +20,22 @@
   <div class="card standing" id="standing">
     <header>
       <h2>Where this sits</h2>
+      <span class="axis-pick">
+        <button class="tb small" id="y-fit" title="the y axis fitted to the runs">fit runs</button>
+        <button class="tb small" id="y-full" title="the whole 226">full scale</button>
+        <span class="axis-sep">showing</span>
+        <button class="tb small" id="show-lives" title="a dot for every life">lives</button>
+        <button class="tb small" id="show-humans" title="the paper's human runs">humans</button>
+        <button class="tb small" id="show-rl" title="published RL results">published RL</button>
+      </span>
       <span class="hint" id="standing-hint"></span>
     </header>
     <div class="body">
       <div class="standing-grid">
         <div>
-          <div class="chart-wrap"><canvas id="chart"></canvas></div>
+          <div class="chart-wrap"><canvas id="chart"></canvas>
+            <div class="chart-tip" id="chart-tip" hidden></div></div>
+          <div class="chart-series" id="chart-series"></div>
           <div class="chart-legend" id="chart-legend"></div>
           <p class="note" id="chart-note"></p>
         </div>
@@ -184,6 +194,8 @@ function buildMatrix() {
     const deepest = g.record.max_level > 0 ? `reached level ${g.record.max_level}` : "never left the surface";
     row.innerHTML =
       `<td class="name"><span class="dot ${mark}"></span>` +
+      /* The colour its line and its lives are drawn in, on the chart below. */
+      `<i class="swatch" style="background:${colourOf(g)}"></i>` +
       /* The arm leads — CLI and model — because every arm plays the same world at
          the same seed and `craftax:0` alone would name them all identically. */
       `${esc(g.arm || g.agent)} · ${esc(g.variant)}:${esc(g.seed)}` +
@@ -232,49 +244,103 @@ function prefetch(i) {
 }
 
 /* ── where this sits ────────────────────────────────────────────────────────
-   Best single-life return against steps spent, for the six human trajectories and
-   for the run being shown. Best-life rather than session total because a new life
-   re-earns every achievement, so a session sum cannot be compared across runs that
-   died different numbers of times — our seven-life pilot sums to 224 of 226 where
-   its best life is 40.
+   Best single-life return against steps spent, for every run on the page, the six
+   human trajectories and the published RL. Best-life rather than session total
+   because a new life re-earns every achievement, so a session sum cannot be
+   compared across runs that died different numbers of times — our seven-life pilot
+   sums to 224 of 226 where its best life is 40.
 
-   The x axis is linear in steps, 0 to the longest run. The y axis is the
-   whole 226, un-zoomed, because that is the finding — every published number and
-   every one of our lives sits in the bottom fifth, and one person went to the top. */
+   Each run has its own colour, the same one its row carries in the table, and every
+   life it played is a dot at the step it ended and the score it made — the line is
+   only the upper envelope of those dots, and the mean in the table is their middle.
+
+   The x axis is linear in steps, 0 to the longest run. The y axis opens fitted to
+   the runs, because on the whole 226 every one of them shares the bottom fifth and
+   cannot be told apart; "full scale" puts back the axis the finding is stated on —
+   every published number and every one of our lives down there, and one person at
+   the top. */
 const MAX = 226;
-let hover = null;      /* step under the pointer, or null */
+/* Ten hues that stay apart on the light and the dark panel alike. */
+const PALETTE = ["#2a78d6", "#e0542b", "#1f9d55", "#9b59d0", "#c9950c",
+                 "#0e9aa7", "#d6457f", "#7a8b2e", "#5b6ee1", "#a0522d"];
+const view = { fit: true, lives: true, humans: true, rl: true };
+let hidden = new Set();   /* labels switched off in the legend */
+let hover = null;         /* the pointer over the chart, in CSS pixels, or null */
+let focus = null;         /* the run whose legend chip is under the pointer */
+let geom = null;          /* the last drawing's scales, for hit-testing */
+/* Per viewer, and only a convenience: storage can be absent or throw. */
+try {
+  const kept = JSON.parse(localStorage.getItem("craftax-chart") || "{}");
+  Object.assign(view, kept.view || {});
+  hidden = new Set(kept.hidden || []);
+} catch { /* the defaults stand */ }
+function keep() {
+  try { localStorage.setItem("craftax-chart", JSON.stringify({ view, hidden: [...hidden] })); }
+  catch { /* nothing to keep it in */ }
+}
+
+const colourOf = (r) => PALETTE[DATA.runs.indexOf(r) % PALETTE.length];
+const nameOf = (r) => r.arm || r.agent;
+/* The run being shown is always drawn: hiding it would leave the scrubber on nothing. */
+const drawnRuns = () => DATA.runs.filter((r) => r === game || !hidden.has(r.label));
+const pct = (v) => (100 * v / MAX).toFixed(1) + "%";
+
+/* A best-life curve is a step function kept at every point where it moves, so the
+   value at a step is the last point at or before it. Past a run's end there is none. */
+function valueAt(curve, step) {
+  if (!curve.length || step > curve[curve.length - 1][0]) return null;
+  let v = 0;
+  for (const [s, score] of curve) { if (s <= step) v = score; else break; }
+  return v;
+}
 
 function chartBox() {
   const c = el("chart");
   const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(320, c.clientWidth), h = 300;
+  const w = Math.max(320, c.clientWidth), h = c.clientHeight || 420;
   c.width = w * dpr; c.height = h * dpr;
   const g = c.getContext("2d");
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  return { g, w, h, pad: { l: 42, r: 14, t: 12, b: 34 } };
+  /* The right margin is where the published numbers are named, one under another,
+     instead of over the lines they would otherwise sit on. */
+  return { g, w, h, pad: { l: 42, r: view.rl ? 112 : 16, t: 12, b: 34 } };
 }
 
 function ink(name) {
   return getComputedStyle(document.body).getPropertyValue(name).trim();
 }
 
+function path(g, curve, x, y) {
+  g.beginPath();
+  curve.forEach(([step, score], i) =>
+    i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
+  g.stroke();
+}
+
 function drawChart() {
   if (!DATA.replayed) { el("standing").hidden = true; return; }
   const { g, w, h, pad } = chartBox();
-  const runs = DATA.humans || [];
-  const mine = game ? game.curve || [] : [];
-  /* Over every run on the page and not just the one being shown, so that switching
-     arms does not rescale the axis under the comparison. */
+  const people = view.humans ? (DATA.humans || []) : [];
+  const runs = drawnRuns();
+  /* Over every run on the page and not just the ones drawn, so that switching one
+     off does not rescale the axes under the comparison. */
   const ends = DATA.runs.map((r) => (r.curve || []).length ? r.curve[r.curve.length - 1][0] : 0);
-  const top = Math.max(3000, ...runs.map((r) => r.steps), ...ends);
+  const top = Math.max(3000, ...people.map((r) => r.steps), ...ends);
+  const peak = Math.max(1, ...DATA.runs.flatMap((r) =>
+    [...(r.curve || []).map((p) => p[1]), ...(r.lives || []).map((l) => l[1])]));
+  const tenth = MAX / 10;
+  const yTop = view.fit ? Math.min(MAX, Math.max(2, Math.ceil((peak * 1.1) / tenth)) * tenth) : MAX;
   const x = (step) => pad.l + (step / top) * (w - pad.l - pad.r);
-  const y = (score) => h - pad.b - (score / MAX) * (h - pad.t - pad.b);
+  const y = (score) => h - pad.b - (score / yTop) * (h - pad.t - pad.b);
+  geom = { x, y, top, yTop, pad, w, h,
+           step: (px) => ((px - pad.l) / (w - pad.l - pad.r)) * top };
   g.clearRect(0, 0, w, h);
 
   const line = ink("--line"), soft = ink("--ink-3"), body = ink("--ink-2");
   g.font = "10px ui-monospace, monospace";
 
-  /* Grid: about six even steps across, twenty points of the 226 up. */
+  /* Grid: about six even steps across; a tenth of the 226 up when fitted, a fifth
+     when it is the whole axis. */
   g.strokeStyle = line; g.fillStyle = soft; g.lineWidth = 1;
   const raw = top / 6, mag = Math.pow(10, Math.floor(Math.log10(raw)));
   const tick = mag * ([1, 2, 5, 10].find((m) => m * mag >= raw));
@@ -283,95 +349,277 @@ function drawChart() {
     g.textAlign = "center";
     g.fillText(at >= 1000 ? at / 1000 + "k" : String(at), x(at), h - pad.b + 14);
   }
+  g.textAlign = "left";
+  g.fillText("steps", pad.l + 2, h - pad.b + 27);
   g.textAlign = "right";
-  for (let v = 0; v <= MAX; v += 50) {
+  const up = yTop <= MAX * 0.6 ? tenth : 2 * tenth;
+  for (let v = 0; v <= yTop + 1e-9; v += up) {
     g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(w - pad.r, y(v)); g.stroke();
     g.fillText(Math.round((100 * v) / MAX) + "%", pad.l - 6, y(v) + 3);
   }
 
+  g.save();
+  g.beginPath(); g.rect(pad.l, pad.t - 4, w - pad.l - pad.r, h - pad.t - pad.b + 8); g.clip();
+
   /* The published numbers, as bands across the plot. They are Craftax-Symbolic and
-     this run is pixels, so they are drawn dashed — a reference, not a rival. */
-  g.setLineDash([3, 3]);
-  for (const [name, pct, track] of DATA.baselines) {
-    if (track !== "1B") continue;
-    const at = y((pct / 100) * MAX);
-    g.strokeStyle = line; g.beginPath();
-    g.moveTo(pad.l, at); g.lineTo(w - pad.r, at); g.stroke();
-    g.fillStyle = soft; g.textAlign = "left";
-    g.fillText(name, pad.l + 4, at - 3);
+     these runs are pixels, so they are drawn dashed — a reference, not a rival. */
+  const bands = view.rl
+    ? DATA.baselines.filter(([, p, track]) => track === "1B" && (p / 100) * MAX <= yTop)
+    : [];
+  g.setLineDash([3, 3]); g.strokeStyle = soft; g.globalAlpha = 0.55;
+  for (const [, p] of bands) {
+    const at = y((p / 100) * MAX);
+    g.beginPath(); g.moveTo(pad.l, at); g.lineTo(w - pad.r, at); g.stroke();
   }
-  g.setLineDash([]);
+  g.setLineDash([]); g.globalAlpha = 1;
 
   /* The humans, thin and grey — the backdrop. */
-  g.lineWidth = 1.2;
-  runs.forEach((r) => {
-    g.strokeStyle = body; g.globalAlpha = 0.4;
-    g.beginPath();
-    r.curve.forEach(([step, score], i) =>
-      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
-    g.stroke();
-    g.globalAlpha = 1;
+  g.lineWidth = 1.2; g.textAlign = "left";
+  for (const r of people) {
+    g.strokeStyle = body; g.globalAlpha = 0.3;
+    path(g, r.curve, x, y);
+    g.globalAlpha = 0.8;
     const [ls, lv] = r.curve[r.curve.length - 1];
-    g.fillStyle = soft; g.textAlign = "left";
-    g.fillText(r.name, Math.min(w - pad.r - 26, x(ls) + 3), y(lv) - 2);
-  });
+    if (lv <= yTop) {
+      g.fillStyle = soft;
+      g.fillText(r.name, Math.min(w - pad.r - 28, x(ls) + 3), y(lv) - 3);
+    }
+  }
+  g.globalAlpha = 1;
 
-  /* The other arms, dimmed and named by the CLI that played them. The comparison
-     this page exists for is between two of these lines, and asking someone to hold
-     one in their head while they click to the other is not showing it to them. */
-  for (const other of DATA.runs) {
-    const curve = (game && other.label === game.label) ? [] : (other.curve || []);
+  /* Which run is being pointed at, from the legend or the plot. Everything else
+     steps back while it is, so one line can be read against the rest. */
+  const lit = focus || (hover && hover.run) || null;
+  const dim = (r) => (lit && r.label !== lit ? 0.18 : 1);
+
+  /* Every run, the one being shown last so it lies on top. */
+  const order = runs.filter((r) => r !== game).concat(runs.includes(game) ? [game] : []);
+  for (const r of order) {
+    const curve = r.curve || [];
     if (!curve.length) continue;
-    g.strokeStyle = ink("--act"); g.lineWidth = 1.6; g.globalAlpha = 0.3;
-    g.beginPath();
-    curve.forEach(([step, score], i) =>
-      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
-    g.stroke();
-    const [ls, lv] = curve[curve.length - 1];
-    g.globalAlpha = 0.65; g.fillStyle = ink("--act"); g.textAlign = "left";
-    g.fillText(other.arm || other.agent, Math.min(w - pad.r - 30, x(ls) + 3), y(lv) - 2);
-    g.globalAlpha = 1;
+    const mine = r === game;
+    g.strokeStyle = colourOf(r);
+    g.lineWidth = mine ? 2.8 : 1.7;
+    g.globalAlpha = dim(r) * (mine ? 1 : 0.85);
+    path(g, curve, x, y);
   }
 
-  /* This run, in the accent. */
-  if (mine.length) {
-    g.strokeStyle = ink("--act"); g.lineWidth = 2.4;
-    g.beginPath();
-    mine.forEach(([step, score], i) =>
-      i ? g.lineTo(x(step), y(score)) : g.moveTo(x(step), y(score)));
-    g.stroke();
-    /* Where the scrubber is, so the chart and the trajectory are the same object. */
+  /* Each life as a dot: filled where it ended, hollow where it is still being
+     played. The run being shown gets larger ones. */
+  const dots = [];
+  if (view.lives) {
+    for (const r of order) {
+      const mine = r === game;
+      (r.lives || []).forEach(([step, score, open], k) => {
+        const px = x(step), py = y(score);
+        dots.push({ run: r, k, step, score, open, px, py });
+        g.globalAlpha = dim(r) * (mine ? 0.95 : 0.45);
+        g.fillStyle = g.strokeStyle = colourOf(r);
+        g.lineWidth = 1.4;
+        g.beginPath(); g.arc(px, py, mine ? 3.6 : 2.4, 0, 7);
+        open ? g.stroke() : g.fill();
+      });
+    }
+  }
+  geom.dots = dots;
+  g.globalAlpha = 1;
+
+  /* Where the scrubber is, so the chart and the trajectory are the same object. */
+  if (game && (game.curve || []).length) {
     const at = game.frames[idx] ? game.frames[idx].n : 0;
-    let hereScore = 0;
-    for (const [step, score] of mine) { if (step <= at) hereScore = score; else break; }
+    const here = valueAt(game.curve, at) ?? game.curve[game.curve.length - 1][1];
     if (at > 0) {
-      g.fillStyle = ink("--act");
-      g.beginPath(); g.arc(x(at), y(hereScore), 4, 0, 7); g.fill();
+      g.fillStyle = colourOf(game);
+      g.beginPath(); g.arc(x(at), y(here), 4.5, 0, 7); g.fill();
+      g.strokeStyle = ink("--panel"); g.lineWidth = 1.5; g.stroke();
+    }
+  }
+
+  /* The pointer: a rule down the plot and a ring on each line it crosses. */
+  if (hover && hover.px >= pad.l && hover.px <= w - pad.r) {
+    const step = geom.step(hover.px);
+    g.strokeStyle = body; g.globalAlpha = 0.45; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(hover.px, pad.t); g.lineTo(hover.px, h - pad.b); g.stroke();
+    g.globalAlpha = 1;
+    for (const r of runs) {
+      const v = valueAt(r.curve || [], step);
+      if (v === null) continue;
+      g.strokeStyle = colourOf(r); g.fillStyle = ink("--panel"); g.lineWidth = 2;
+      g.beginPath(); g.arc(hover.px, y(v), 3.5, 0, 7); g.fill(); g.stroke();
+    }
+  }
+  g.restore();
+
+  /* The published numbers' names, in the right margin, pushed apart where two of
+     them are closer than a line of text, with a tick back to the band each names. */
+  if (bands.length) {
+    const labels = bands
+      .map(([name, p]) => ({ name: `${name} ${p}`, at: y((p / 100) * MAX) }))
+      .sort((a, b) => a.at - b.at);
+    const gap = 11;
+    labels.forEach((l, i) => { l.y = Math.max(l.at, i ? labels[i - 1].y + gap : pad.t + 4); });
+    for (let i = labels.length - 1; i >= 0; i--) {
+      const floor = i === labels.length - 1 ? h - pad.b : labels[i + 1].y - gap;
+      labels[i].y = Math.min(labels[i].y, floor);
+    }
+    g.textAlign = "left"; g.fillStyle = soft; g.strokeStyle = soft; g.lineWidth = 1;
+    for (const l of labels) {
+      g.globalAlpha = 0.6;
+      g.beginPath(); g.moveTo(w - pad.r, l.at); g.lineTo(w - pad.r + 5, l.y); g.stroke();
+      g.globalAlpha = 1;
+      g.fillText(l.name, w - pad.r + 8, l.y + 3);
     }
   }
 }
 
+/* ── the chart under the pointer ──────────────────────────────────────── */
+/* What the pointer is over: a life's dot within reach, else the line nearest it
+   vertically at that step, else only the step itself. */
+function hitTest(px, py) {
+  if (!geom) return null;
+  const { pad, w, h } = geom;
+  if (px < pad.l || px > w - pad.r || py < pad.t - 6 || py > h - pad.b + 6) return null;
+  const step = Math.max(0, geom.step(px));
+  let best = null, bestD = 7;
+  for (const d of geom.dots || []) {
+    const dd = Math.hypot(d.px - px, d.py - py);
+    if (dd < bestD) { best = d; bestD = dd; }
+  }
+  if (best) return { step, run: best.run, dot: best };
+  let run = null, near = 12;
+  for (const r of drawnRuns()) {
+    const v = valueAt(r.curve || [], step);
+    if (v === null) continue;
+    const dy = Math.abs(geom.y(v) - py);
+    if (dy < near) { run = r; near = dy; }
+  }
+  return { step, run };
+}
+
+function tip(hit) {
+  const box = el("chart-tip");
+  if (!hit) { box.hidden = true; return; }
+  const swatch = (r) => `<i style="background:${colourOf(r)}"></i>`;
+  let html;
+  if (hit.dot) {
+    const d = hit.dot;
+    html = `<div class="tip-head">${swatch(d.run)}${esc(nameOf(d.run))}</div>` +
+      `<div>life ${d.k + 1} — <b>${d.score}</b> points (${pct(d.score)})</div>` +
+      `<div class="tip-dim">${d.open ? "still playing at" : "ended at"} step ` +
+      `${d.step.toLocaleString("en-US")}</div>` +
+      `<div class="tip-dim">click to ${d.run === game ? "jump to its end" : "open this run there"}</div>`;
+  } else {
+    const rows = drawnRuns()
+      .map((r) => ({ r, v: valueAt(r.curve || [], hit.step) }))
+      .filter((o) => o.v !== null)
+      .sort((a, b) => b.v - a.v);
+    html = `<div class="tip-head">step ${Math.round(hit.step).toLocaleString("en-US")} · best life so far</div>` +
+      rows.map(({ r, v }) =>
+        `<div class="${hit.run === r ? "tip-lit" : ""}">${swatch(r)}` +
+        `<span class="tip-name">${esc(nameOf(r))}</span><b>${pct(v)}</b></div>`).join("") +
+      (rows.length ? "" : `<div class="tip-dim">every run had ended by here</div>`) +
+      `<div class="tip-dim">click to ${hit.run && hit.run !== game
+        ? "open the highlighted run" : "move the scrubber here"}</div>`;
+  }
+  box.innerHTML = html;
+  box.hidden = false;
+  /* On whichever side of the pointer has room for it. */
+  const wrap = el("chart").getBoundingClientRect();
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  const left = hover.px + 14 + bw > wrap.width ? hover.px - 14 - bw : hover.px + 14;
+  box.style.left = Math.max(0, left) + "px";
+  box.style.top = Math.max(0, Math.min(wrap.height - bh, hover.py - bh / 2)) + "px";
+}
+
+/* The first frame at or after a step of the run being shown. */
+function jumpTo(step) {
+  const i = game.frames.findIndex((f) => f.n >= step);
+  stop();
+  show(i < 0 ? game.frames.length - 1 : i);
+}
+
+function wireChart() {
+  const c = el("chart");
+  c.addEventListener("pointermove", (e) => {
+    const r = c.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const hit = hitTest(px, py);
+    hover = hit ? { px, py, run: hit.run ? hit.run.label : null } : null;
+    c.style.cursor = hit && (hit.run || hit.dot) ? "pointer" : hit ? "crosshair" : "default";
+    drawChart();
+    tip(hit);
+  });
+  c.addEventListener("pointerleave", () => { hover = null; tip(null); drawChart(); });
+  c.addEventListener("click", (e) => {
+    const r = c.getBoundingClientRect();
+    const hit = hitTest(e.clientX - r.left, e.clientY - r.top);
+    if (!hit) return;
+    const step = hit.dot ? hit.dot.step : hit.step;
+    if (hit.run && hit.run !== game) load(hit.run.label);
+    jumpTo(step);
+  });
+  /* The scale and the layers, in the card's header. */
+  const sync = () => {
+    el("y-fit").classList.toggle("on", view.fit);
+    el("y-full").classList.toggle("on", !view.fit);
+    for (const k of ["lives", "humans", "rl"]) el("show-" + k).classList.toggle("on", view[k]);
+  };
+  el("y-fit").addEventListener("click", () => { view.fit = true; sync(); keep(); drawChart(); });
+  el("y-full").addEventListener("click", () => { view.fit = false; sync(); keep(); drawChart(); });
+  for (const k of ["lives", "humans", "rl"]) {
+    el("show-" + k).addEventListener("click", () => {
+      view[k] = !view[k]; sync(); keep(); drawChart(); buildLegend();
+    });
+  }
+  if (!(DATA.humans || []).length) el("show-humans").hidden = true;
+  sync();
+}
+
+/* One chip a run: its colour, its name, its best and mean life. A click switches it
+   on or off; a double click opens it; pointing at one lights its line. */
+function buildSeries() {
+  el("chart-series").innerHTML = DATA.runs.map((r) => {
+    const rec = r.record || {};
+    const off = r !== game && hidden.has(r.label);
+    return `<button class="series-chip${r === game ? " shown" : ""}${off ? " off" : ""}" ` +
+      `data-label="${esc(r.label)}" title="${esc(nameOf(r))} (${esc(r.label)}) — ${r === game ? "the run being shown"
+        : off ? "click to draw it · double-click to open it"
+        : "click to hide it · double-click to open it"}">` +
+      `<i style="background:${colourOf(r)}"></i><span>${esc(nameOf(r))}</span>` +
+      `<em>best ${(rec.best_episode_pct ?? 0).toFixed(1)}% · mean ${(rec.mean_episode_pct ?? 0).toFixed(1)}%</em>` +
+      `</button>`;
+  }).join("");
+  el("chart-series").querySelectorAll(".series-chip").forEach((chip) => {
+    const label = chip.dataset.label;
+    chip.addEventListener("click", () => {
+      if (game && label === game.label) return;
+      hidden.has(label) ? hidden.delete(label) : hidden.add(label);
+      keep(); buildSeries(); drawChart();
+    });
+    chip.addEventListener("dblclick", () => { hidden.delete(label); keep(); load(label); });
+    chip.addEventListener("pointerenter", () => { focus = label; drawChart(); });
+    chip.addEventListener("pointerleave", () => { focus = null; drawChart(); });
+  });
+}
+
 function buildLegend() {
-  const mine = game && game.curve && game.curve.length
-    ? game.curve[game.curve.length - 1][1] : 0;
-  const mean = game && game.record ? (game.record.mean_episode ?? 0) - 0.9 : 0;
+  buildSeries();
   el("chart-legend").innerHTML =
-    `<span><i style="background:${ink("--act")}"></i>${esc(game.arm || game.agent)} — best life ` +
-    `${(100 * mine / MAX).toFixed(1)}%, mean of ` +
-    `${game.record.episodes_completed ?? 0} lives ${(100 * mean / MAX).toFixed(1)}%</span>` +
-    (DATA.runs.length > 1
-      ? `<span><i style="background:${ink("--act")};opacity:.3"></i>the other ` +
-        `${plural(DATA.runs.length - 1, "arm")} on this page, same axes</span>` : "") +
-    `<span><i class="human"></i>${plural((DATA.humans || []).length, "human run")}` +
-    ` from the paper's own dataset</span>` +
-    `<span><i class="dash"></i>published RL, after a billion training steps</span>`;
+    (view.lives
+      ? `<span><i class="life"></i>one life, at the step it ended and the score it made</span>` +
+        `<span><i class="life open"></i>the life still being played</span>` : "") +
+    (view.humans && (DATA.humans || []).length
+      ? `<span><i class="human"></i>${plural(DATA.humans.length, "human run")}` +
+        ` from the paper's own dataset</span>` : "") +
+    (view.rl ? `<span><i class="dash"></i>published RL, after a billion training steps</span>` : "");
   el("chart-note").innerHTML =
     "<b>Best single-life return</b> against steps spent — best-life rather than " +
     "session total, because a new life re-earns every achievement and a session sum " +
-    "cannot be compared across runs that died different numbers of times. The table " +
-    "beside this plots a different quantity: <b>mean</b> episode return, which is what " +
-    "the paper reports, and which is lower than the best life whenever a run had a " +
-    "bad one.";
+    "cannot be compared across runs that died different numbers of times. The dots " +
+    "are every life on its own, so the spread under each line is what the table's " +
+    "<b>mean</b> is taken over — the number the paper reports, and lower than the " +
+    "best life whenever a run had a bad one. Point at the plot to read every run at " +
+    "one step; click it to scrub there.";
 }
 
 function buildBaselines() {
@@ -390,7 +638,7 @@ function buildBaselines() {
     "<tr><th>method</th><th>env steps</th><th>% of 226</th></tr>" +
     rows.map((r) =>
       `<tr class="${r.mine ? "mine" : ""}"><td>${esc(r.name)}</td>` +
-      `<td class="track">${(r.mine ? steps : budget[r.track]).toLocaleString("en-US")}</td>` +
+      `<td class="budget">${(r.mine ? steps : budget[r.track]).toLocaleString("en-US")}</td>` +
       `<td class="num">${r.pct.toFixed(1)}</td></tr>`).join("");
   el("baseline-note").innerHTML =
     "Published numbers are mean episode return on <b>Craftax-Symbolic</b>; this run " +
@@ -821,5 +1069,6 @@ el("footer").innerHTML = `
     cursor reaches it.</p>`}`;
 
 buildMatrix();
+wireChart();
 load(DATA.runs[0].label);
 </script>

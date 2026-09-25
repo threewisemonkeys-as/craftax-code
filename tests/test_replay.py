@@ -25,6 +25,7 @@ from replay import (  # noqa: E402
     assign,
     best_curve,
     attribute,
+    lives_at,
     batches,
     build,
     keep,
@@ -360,6 +361,24 @@ def test_the_curve_only_goes_up_and_a_death_does_not_undo_it():
     curve = best_curve([1, 1, -0.1, 1, -0.9], [False, False, False, False, True])
     assert curve == [1, 2, 2, 2.9, 2.9]
     assert curve == sorted(curve)
+
+
+def test_each_life_is_a_dot_where_it_ended():
+    """The chart's dots: one a life, at the step it ended, on the curve's own axis."""
+    rows = [{"reward": r, "alive": a} for r, a in
+            [(1, True), (2, False), (5, True), (-0.5, True), (1, False), (3, True)]]
+    # Without a record to agree with, the replay's own sums stand.
+    assert lives_at(rows, []) == [[2, 3.0, False], [5, 5.5, False], [6, 3.0, True]]
+
+
+def test_a_dot_carries_the_records_score_when_they_agree():
+    """The table's mean is over `episode_scores`, so the dots use those — but only
+    when the record and the replay count the same lives. A page built mid-life can
+    see a death the record has not written yet."""
+    rows = [{"reward": 1, "alive": False}, {"reward": 1, "alive": True}]
+    assert lives_at(rows, [7, 4]) == [[1, 7, False], [2, 4, True]]
+    assert lives_at(rows, [7]) == [[1, 1.0, False], [2, 1.0, True]]
+    assert lives_at([], []) == []
 
 
 def test_a_life_in_progress_counts_before_it_ends():

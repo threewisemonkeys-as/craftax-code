@@ -274,13 +274,46 @@ pre.code.err { border-color: var(--critical); }
 .standing-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); gap: 20px; align-items: start; }
 @media (max-width: 900px) { .standing-grid { grid-template-columns: 1fr; } }
 .chart-wrap { width: 100%; }
-#chart { width: 100%; height: 300px; display: block; }
+.chart-wrap { position: relative; }
+#chart { width: 100%; height: 420px; display: block; touch-action: pan-y; }
+@media (max-width: 600px) { #chart { height: 320px; } }
+.chart-tip { position: absolute; pointer-events: none; z-index: 5; min-width: 180px; max-width: 480px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.14); padding: 8px 10px;
+  font: 11px/1.55 var(--mono); color: var(--ink-2); }
+.chart-tip div { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.chart-tip i { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
+.chart-tip .tip-head { color: var(--ink); font-weight: 600; margin-bottom: 3px; }
+.chart-tip .tip-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.chart-tip b { color: var(--ink); font-weight: 600; margin-left: 10px; }
+.chart-tip .tip-lit { color: var(--ink); background: var(--sunk); margin: 0 -4px; padding: 0 4px; border-radius: 4px; }
+.chart-tip .tip-dim { color: var(--ink-3); margin-top: 3px; }
+.chart-series { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 2px 10px; margin-top: 10px; }
+.series-chip { display: flex; align-items: center; gap: 7px; padding: 4px 8px; min-width: 0;
+  border: 1px solid transparent; border-radius: 6px; background: none; text-align: left;
+  font: 500 11.5px var(--sans); color: var(--ink); cursor: pointer; }
+.series-chip:hover { background: var(--sunk); }
+.series-chip i { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.series-chip span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.series-chip em { font: normal 10.5px var(--mono); color: var(--ink-3); white-space: nowrap; }
+.series-chip.shown { border-color: var(--line); background: var(--sunk); cursor: default; }
+.series-chip.shown span { font-weight: 600; }
+.series-chip.off { opacity: .45; }
+.series-chip.off span { text-decoration: line-through; }
+.series-chip.off i { background: none !important; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+.swatch { width: 10px; height: 3px; border-radius: 2px; display: inline-block; margin-right: 7px; vertical-align: 3px; }
+.axis-pick { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: 14px; }
+.axis-pick .axis-sep { font: 11px var(--mono); color: var(--ink-3); margin: 0 4px; }
+button.tb.small.on { background: var(--act-soft); border-color: var(--act); color: var(--act); }
 .chart-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px;
                 font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
 .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .chart-legend i { width: 14px; height: 2px; display: inline-block; background: var(--ink-2); }
 .chart-legend i.human { opacity: .4; }
-.chart-legend i.dash { background: none; border-top: 1px dashed var(--line); height: 0; }
+.chart-legend i.dash { background: none; border-top: 1px dashed var(--ink-3); height: 0; }
+.chart-legend i.life { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-2); }
+.chart-legend i.life.open { background: none; box-shadow: inset 0 0 0 1.5px var(--ink-2); }
 
 table.baselines { border-collapse: collapse; width: 100%; }
 table.baselines th { font-weight: 500; font-size: 10px; letter-spacing: .08em;
@@ -290,6 +323,6 @@ table.baselines th:first-child { text-align: left; }
 table.baselines td { padding: 5px 8px; font-family: var(--mono); font-size: 12px;
   text-align: right; color: var(--ink-2); border-bottom: 1px solid var(--line-soft); }
 table.baselines td:first-child { text-align: left; font-family: var(--sans); color: var(--ink); }
-table.baselines td.track { font-size: 10.5px; color: var(--ink-3); }
+table.baselines td.budget { font-size: 10.5px; color: var(--ink-3); }
 table.baselines tr.mine td { background: var(--act-soft); color: var(--act); font-weight: 600; }
 table.baselines tr.mine td:first-child { color: var(--act); }

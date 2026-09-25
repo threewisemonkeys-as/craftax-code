@@ -436,6 +436,29 @@ def thin(curve: list[float], points: int = 320) -> list[list[float]]:
     return [[i + 1, curve[i]] for i in sorted(wanted)]
 
 
+def lives_at(rows: list[dict], scores: list) -> list[list]:
+    """Each life as `[step it ended at, its score, still playing]`, for the chart's dots.
+
+    The step is where the replay saw the life end, on the same step axis as the curve.
+    The score is the record's own (`episode_scores`), the number the table's mean is
+    taken over, whenever the record and the replay agree on how many lives there were;
+    a page built mid-life can see one death the record has not written yet, and then
+    the replay's own sum for that life stands in.
+    """
+    out, current = [], 0.0
+    for i, row in enumerate(rows):
+        current += float(row["reward"])
+        if not row["alive"]:
+            out.append([i + 1, round(current, 2), False])
+            current = 0.0
+    if rows and rows[-1]["alive"]:
+        out.append([len(rows), round(current, 2), True])
+    if len(scores) == len(out):
+        for life, score in zip(out, scores, strict=True):
+            life[1] = score
+    return out
+
+
 def thousands(n: int) -> str:
     """3000 as `3k`, 2500 as `2.5k`, 800 as `800`."""
     return f"{n / 1000:g}k" if n >= 1000 else str(n)
@@ -572,6 +595,16 @@ def agent_of(stream: Path) -> str:
     from readout import whose  # noqa: PLC0415
 
     return whose(stream.read_text(errors="replace").splitlines())
+
+
+def effort_of(root: Path, label: str) -> str:
+    """The reasoning effort the launcher gave a run, or "" for the CLI's default —
+    which is also all a run launched before the arm file existed can say."""
+    arm = root / run.RIG / "arms" / f"{label}.json"
+    try:
+        return str(json.loads(arm.read_text()).get("effort") or "") if arm.exists() else ""
+    except json.JSONDecodeError:
+        return ""
 
 
 def model_of(root: Path, label: str, agent: str, report: dict | None) -> str:
@@ -719,7 +752,10 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
             "model": (model := model_of(root, label, agent, report)),
             "arm": f"{agent} {model.removeprefix('claude-')} · stint "
                    f"{thousands(record.get('stint') or record.get('budget') or 0)} · "
-                   f"{'fresh' if record.get('fresh_world') else 'same'} world",
+                   f"{'fresh' if record.get('fresh_world') else 'same'} world"
+                   # And the reasoning effort, where the launch set one: two runs
+                   # differing in nothing else were the same row before it.
+                   + (f" · {effort} effort" if (effort := effort_of(root, label)) else ""),
             # Whether the sessions ran inside the filesystem fence — no longer a fact
             # about the CLI alone, since a Claude run can be launched with `--fence`.
             "fenced": fenced_of(root, label, agent, report),
@@ -748,6 +784,7 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
             "frames": frames, "batches": made, "looked": looked, "derived": derived,
             "handovers": handovers,
             "curve": curve,
+            "lives": lives_at(rows, list(record.get("episode_scores") or [])),
             "notes": (ws / "notes.md").read_text(errors="replace")[:40000]
             if (ws / "notes.md").exists() else "",
             "files": sorted(p.name for p in ws.glob("*.py")),
