@@ -1193,13 +1193,18 @@ async def play(
             print(f"[{label}] named the game: {report.audit.named_the_game[:160]}",
                   flush=True)
         if not report.audit.clean:
-            print(f"[{label}] AUDIT FAILED — this run is not evidence:", flush=True)
+            print(f"[{label}] AUDIT FAILED — "
+                  + ("something got through, this run is not evidence:"
+                     if report.audit.leaked
+                     else "it reached past the game and got nothing back:"),
+                  flush=True)
             for name, hits in report.audit.findings.items():
                 # Flattened: a hit is a 200-character excerpt of what the session
                 # ran, and a heredoc's newlines would otherwise spill the finding
                 # across a dozen unprefixed lines of the launch log.
                 excerpt = " ".join(hits[0].split())
-                print(f"[{label}]   {name}: {excerpt[:140]}", flush=True)
+                got = " (LEAKED)" if name in report.audit.leaks else ""
+                print(f"[{label}]   {name}{got}: {excerpt[:140]}", flush=True)
         return report
 
 
@@ -1237,7 +1242,8 @@ def summarise(reports: list[Report], root: Path) -> None:
     print(f"\n{'world':16}  label  mean%    n  best%  union%  actions  lives  deaths  "
           f"depth  sess   cost   minutes")
     for r in sorted(reports, key=lambda r: (r.variant, r.seed)):
-        mark = "" if r.audit.clean else "  AUDIT FAILED"
+        mark = ("" if r.audit.clean else "  AUDIT FAILED: LEAKED" if r.audit.leaked
+                else "  AUDIT FAILED: attempted")
         world = f"{r.variant}:{r.seed}"
         print(
             f"{world:16}  {r.label}  {r.mean_episode_pct:5.1f}  "

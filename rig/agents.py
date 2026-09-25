@@ -85,6 +85,7 @@ class Agent(Protocol):
     def absorb(self, report: Any, event: dict) -> None: ...
     def ran(self, event: dict) -> list[str]: ...
     def results(self, event: dict) -> list[str]: ...
+    def exchanges(self, event: dict) -> list[tuple[str, list[str] | None, str | None]]: ...
     def web(self, event: dict) -> int: ...
     def images(self, event: dict) -> int: ...
     def freshness(self, path: Path) -> float: ...
@@ -238,6 +239,30 @@ class Claude:
             return 0
         counts = (event.get("usage") or {}).get("server_tool_use") or {}
         return sum(int(v) for k, v in counts.items() if k.endswith("_requests"))
+
+    def exchanges(self, event: dict) -> list[tuple[str, list[str] | None, str | None]]:
+        """Each call as `(id, what it ran, what came back)`, either half possibly None.
+
+        The call and its result are separate events here — the tool_use in an
+        assistant turn, the tool_result in the next user turn — so each event yields
+        one half and the audit joins them on the id. `ran` above says what a session
+        *tried*; this is what lets the audit say whether it got anything.
+        """
+        kind = event.get("type")
+        got = []
+        for block in event.get("message", {}).get("content", []):
+            if kind == "assistant" and block.get("type") in ("tool_use", "server_tool_use"):
+                one = {"type": "assistant", "message": {"content": [block]}}
+                got.append((str(block.get("id", "")), self.ran(one), None))
+            elif kind == "user" and block.get("type") == "tool_result":
+                body = block.get("content", "")
+                if isinstance(body, list):
+                    body = " ".join(
+                        str(p.get("text", "")) if p.get("type") != "image" else "<image>"
+                        for p in body if isinstance(p, dict)
+                    )
+                got.append((str(block.get("tool_use_id", "")), None, str(body)))
+        return got
 
     def results(self, event: dict) -> list[str]:
         if event.get("type") != "user":
@@ -462,6 +487,23 @@ class Codex:
         if item.get("type") in ("file_change", "patch_apply"):
             return [str(item)]
         return []
+
+    def exchanges(self, event: dict) -> list[tuple[str, list[str] | None, str | None]]:
+        """Each call as `(id, what it ran, what came back)` — see `Claude.exchanges`.
+
+        A command and its output are one event here. A harvested image view has no
+        output this CLI records, only the fact that the image was put in front of the
+        model — so what came back is the picture itself, `<image>`.
+        """
+        said = self.ran(event)
+        if not said:
+            return []
+        item = event.get("item", {})
+        if event.get("type") == HARVESTED:
+            return [(f"harvested:{event.get('at', '')}:{item.get('path', '')}", said, "<image>")]
+        out = (str(item.get("aggregated_output", ""))
+               if item.get("type") == "command_execution" else None)
+        return [(str(item.get("id", "")), said, out)]
 
     def results(self, event: dict) -> list[str]:
         item = event.get("item", {})

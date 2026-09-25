@@ -165,13 +165,18 @@ function buildMatrix() {
   t.innerHTML = "<tr><th>Run</th><th>What it reached</th>" +
     COLS.map(([h]) => `<th>${h}</th>`).join("") + "</tr>";
   for (const g of DATA.runs) {
-    /* Three states and not two. A session is audited when it ends, so a page built
-       while a run is still playing has no verdict on it yet — and a green dot would
-       be claiming one it does not have. */
+    /* Four states. A session is audited when it ends, so a page built while a run
+       is still playing has no verdict on it yet — and a green dot would be claiming
+       one it does not have. A finding is yellow when the session tried to reach past
+       the game and got nothing back, red when something came back. A report from
+       before the audit read outputs has findings and no `leaks` at all: it was never
+       asked whether anything got through, so it keeps the old red. */
     const audit = g.report.audit;
     const dirty = !!audit && Object.keys(audit.findings || {}).length > 0;
-    const mark = !audit ? "zero" : dirty ? "critical" : "good";
-    const verdict = !audit ? "not audited yet" : dirty ? "AUDIT FLAGGED" : "audit clean";
+    const leaked = dirty && (!audit.leaks || Object.keys(audit.leaks).length > 0);
+    const mark = !audit ? "zero" : leaked ? "critical" : dirty ? "warning" : "good";
+    const verdict = !audit ? "not audited yet" : leaked ? "AUDIT: LEAKED"
+      : dirty ? "audit: attempted, nothing leaked" : "audit clean";
     const row = document.createElement("tr");
     row.className = "game-row";
     row.dataset.label = g.label;
@@ -729,7 +734,9 @@ function load(label) {
     `${r.actions_used} actions · ${r.lives} lives · ${r.deaths} deaths · ` +
     (sessions > 1 ? `${sessions} sessions · ` : "") +
     `${(r.mean_episode_pct ?? 0).toFixed(1)}% mean of ${r.episodes_completed ?? 0} · ` +
-    `audit ${Object.keys(audit.findings || {}).length ? "FLAGGED" : "clean"}`;
+    (!Object.keys(audit.findings || {}).length ? "audit clean"
+      : !audit.leaks || Object.keys(audit.leaks).length ? "audit LEAKED"
+      : "audit: attempted, nothing leaked");
   el("notes").innerHTML = game.notes
     ? `<pre class="code">${esc(game.notes)}</pre>`
     : `<p class="empty">This session left no notes.md.</p>`;
