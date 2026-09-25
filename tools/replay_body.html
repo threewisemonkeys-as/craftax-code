@@ -35,6 +35,13 @@
         <div>
           <div class="chart-wrap"><canvas id="chart"></canvas>
             <div class="chart-tip" id="chart-tip" hidden></div></div>
+          <div class="series-bar" id="series-bar">
+            <span class="series-title">Runs on the plot</span>
+            <button class="tb small" id="runs-all" title="draw every run">all</button>
+            <button class="tb small" id="runs-only" title="draw only the run being shown">only the shown run</button>
+            <button class="tb small" id="runs-invert" title="swap drawn and hidden">invert</button>
+            <span class="series-count" id="runs-count"></span>
+          </div>
           <div class="chart-series" id="chart-series"></div>
           <div class="chart-legend" id="chart-legend"></div>
           <p class="note" id="chart-note"></p>
@@ -572,6 +579,16 @@ function wireChart() {
     });
   }
   if (!(DATA.humans || []).length) el("show-humans").hidden = true;
+  /* Which runs are drawn, in bulk. The run being shown is always drawn, since the
+     scrubber sits on it, so "only" and "invert" leave it where it is. */
+  const others = () => DATA.runs.filter((r) => r !== game).map((r) => r.label);
+  const apply = () => { keep(); buildSeries(); drawChart(); };
+  el("runs-all").addEventListener("click", () => { hidden.clear(); apply(); });
+  el("runs-only").addEventListener("click", () => { hidden = new Set(others()); apply(); });
+  el("runs-invert").addEventListener("click", () => {
+    hidden = new Set(others().filter((label) => !hidden.has(label)));
+    apply();
+  });
   sync();
 }
 
@@ -582,13 +599,18 @@ function buildSeries() {
     const rec = r.record || {};
     const off = r !== game && hidden.has(r.label);
     return `<button class="series-chip${r === game ? " shown" : ""}${off ? " off" : ""}" ` +
-      `data-label="${esc(r.label)}" title="${esc(nameOf(r))} (${esc(r.label)}) — ${r === game ? "the run being shown"
+      `data-label="${esc(r.label)}" aria-pressed="${!off}" title="${esc(nameOf(r))} (${esc(r.label)}) — ${r === game ? "the run being shown — always drawn"
         : off ? "click to draw it · double-click to open it"
         : "click to hide it · double-click to open it"}">` +
-      `<i style="background:${colourOf(r)}"></i><span>${esc(nameOf(r))}</span>` +
+      `<span class="check${off ? "" : " on"}${r === game ? " locked" : ""}" aria-hidden="true"></span>` +
+      `<i style="background:${colourOf(r)}"></i><span class="series-name">${esc(nameOf(r))}</span>` +
       `<em>best ${(rec.best_episode_pct ?? 0).toFixed(1)}% · mean ${(rec.mean_episode_pct ?? 0).toFixed(1)}%</em>` +
       `</button>`;
   }).join("");
+  const drawnN = DATA.runs.filter((r) => r === game || !hidden.has(r.label)).length;
+  el("runs-count").textContent = `${drawnN} of ${DATA.runs.length} drawn`;
+  /* One run on the page has nothing to hide. */
+  el("series-bar").hidden = DATA.runs.length < 2;
   el("chart-series").querySelectorAll(".series-chip").forEach((chip) => {
     const label = chip.dataset.label;
     chip.addEventListener("click", () => {

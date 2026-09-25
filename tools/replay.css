@@ -295,13 +295,11 @@ pre.code.err { border-color: var(--critical); }
   font: 500 11.5px var(--sans); color: var(--ink); cursor: pointer; }
 .series-chip:hover { background: var(--sunk); }
 .series-chip i { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.series-chip span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.series-chip .series-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .series-chip em { font: normal 10.5px var(--mono); color: var(--ink-3); white-space: nowrap; }
 .series-chip.shown { border-color: var(--line); background: var(--sunk); cursor: default; }
-.series-chip.shown span { font-weight: 600; }
-.series-chip.off { opacity: .45; }
-.series-chip.off span { text-decoration: line-through; }
-.series-chip.off i { background: none !important; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+.series-chip.shown .series-name { font-weight: 600; }
+.series-chip.off { opacity: .5; }
 .swatch { width: 10px; height: 3px; border-radius: 2px; display: inline-block; margin-right: 7px; vertical-align: 3px; }
 .axis-pick { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: 14px; }
 .axis-pick .axis-sep { font: 11px var(--mono); color: var(--ink-3); margin: 0 4px; }
@@ -326,3 +324,16 @@ table.baselines td:first-child { text-align: left; font-family: var(--sans); col
 table.baselines td.budget { font-size: 10.5px; color: var(--ink-3); }
 table.baselines tr.mine td { background: var(--act-soft); color: var(--act); font-weight: 600; }
 table.baselines tr.mine td:first-child { color: var(--act); }
+
+/* Which runs the chart draws: a checkbox a run, and the bulk switches above them. */
+.series-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; }
+.series-title { font: 500 10px var(--mono); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-3); margin-right: 4px; }
+.series-count { font: 11px var(--mono); color: var(--ink-3); margin-left: auto; }
+.series-chip .check { width: 13px; height: 13px; flex: none; border-radius: 3px;
+  border: 1.5px solid var(--ink-3); position: relative; }
+.series-chip .check.on { background: var(--ink-2); border-color: var(--ink-2); }
+.series-chip .check.on::after { content: ""; position: absolute; left: 3.5px; top: 0.5px;
+  width: 3px; height: 7px; border: solid var(--panel); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.series-chip .check.locked { opacity: .45; }
+.series-chip:focus-visible { outline: 2px solid var(--focus, var(--act)); outline-offset: 1px; }
