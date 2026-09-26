@@ -25,6 +25,7 @@
 
   --stage:     #0d0f12;
   --focus:     #2a78d6;
+  --learn:     #0e9aa7;   /* the world model being updated            */
 
   --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
@@ -47,6 +48,7 @@
     --off-soft:  #d9592626;
     --stage:     #0a0c0e;
     --focus:     #3987e5;
+    --learn:     #2fb5c2;
   }
 }
 :root[data-theme="dark"] {
@@ -65,6 +67,7 @@
   --off-soft:  #d9592626;
   --stage:     #0a0c0e;
   --focus:     #3987e5;
+  --learn:     #2fb5c2;
 }
 
 * { box-sizing: border-box; }
@@ -337,3 +340,78 @@ table.baselines tr.mine td:first-child { color: var(--act); }
   width: 3px; height: 7px; border: solid var(--panel); border-width: 0 2px 2px 0; transform: rotate(45deg); }
 .series-chip .check.locked { opacity: .45; }
 .series-chip:focus-visible { outline: 2px solid var(--focus, var(--act)); outline-offset: 1px; }
+
+/* ── learning ───────────────────────────────────────────────────────────────
+   The world-model arm's updates. A boundary on the track like a handover, in its
+   own colour, and a card of its own under the play.                        */
+.legend-row i.learn { width: 2px; height: 12px; background: var(--learn); display: inline-block; }
+.mark.learn { top: 2px; height: 70px; width: 2px; background: var(--learn); opacity: .8; }
+.mark.learn::before { content: ""; position: absolute; top: -1px; left: -3px; width: 8px; height: 8px;
+  background: var(--learn); transform: rotate(45deg); border-radius: 1px; }
+.mark.learn.failed, .mark.learn.failed::before { background: var(--critical); }
+.mark.learn.running { opacity: .45; }
+
+.card.learning { margin-top: 18px; }
+.learn-top { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .learn-top { grid-template-columns: 1fr; } }
+.learn-picks { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.learn-picks .dot { margin: 0 0 0 4px; }
+.learn-chart svg { width: 100%; height: auto; display: block; }
+.learn-chart .grid { stroke: var(--line-soft); stroke-width: 1; }
+.learn-chart .chance { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 4 3; }
+.learn-chart .ax { font: 10px var(--mono); fill: var(--ink-3); }
+.learn-chart .col rect { fill: transparent; cursor: pointer; }
+.learn-chart .col:hover rect { fill: var(--sunk); }
+.learn-chart .col.on rect { fill: var(--act-soft); }
+.learn-chart .chart-legend i { height: 3px; }
+#learn-facts .facts { margin: 0; }
+#learn-detail h3 { font: 600 13px var(--sans); color: var(--ink); margin: 22px 0 8px; }
+#learn-detail h3 .sub { font-weight: 400; color: var(--ink-3); font-size: 12px; margin-left: 6px; }
+.learn-err { color: var(--critical); font-family: var(--mono); font-size: 12px; }
+.pre { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.pre > div { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; background: var(--sunk); border-radius: 8px; }
+.pre .big { font: 600 22px var(--mono); color: var(--ink); }
+.pre span { font-size: 12px; color: var(--ink-2); line-height: 1.45; }
+
+.tree { display: flex; flex-direction: column; gap: 3px; }
+.node { display: grid; grid-template-columns: 34px minmax(0, 1fr) 120px 48px 54px auto; gap: 10px;
+  align-items: center; padding: 4px 8px 4px calc(8px + var(--depth) * 18px); border-radius: 6px; font-size: 12.5px; }
+.node:nth-child(odd) { background: var(--sunk); }
+.node.shipped { box-shadow: inset 2px 0 0 var(--good); }
+.node .id { font: 600 12px var(--mono); color: var(--ink); }
+.node .what { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.node .bar i { display: block; height: 100%; background: var(--learn); }
+.node .num { font: 12px var(--mono); text-align: right; color: var(--ink); }
+.node .delta.up { color: var(--good); }
+.node .delta.down { color: var(--critical); }
+.node .tags .chip { font-size: 9.5px; padding: 1px 6px; }
+@media (max-width: 600px) {
+  .node { grid-template-columns: 30px minmax(0, 1fr) 44px 50px; }
+  .node .bar, .node .tags { display: none; }
+}
+
+.lstep details { margin-top: 6px; }
+.lstep .chip { margin-left: auto; }
+#learn-detail details > summary { cursor: pointer; font-size: 12.5px; color: var(--act); padding: 2px 0; }
+#learn-detail details.inner { margin-left: 14px; }
+#learn-detail details.log { margin-top: 18px; }
+pre.code.diff, pre.code.prose { max-height: 480px; }
+pre.code.diff .add { color: var(--good); }
+pre.code.diff .del { color: var(--critical); }
+pre.code.diff .hunk { color: var(--ink-3); }
+.exs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 8px; }
+.ex { border: 1px solid var(--line-soft); border-left: 3px solid var(--critical); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.ex.right { border-left-color: var(--good); }
+.ex-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12px; color: var(--ink-2); }
+.ex-head code { font: 500 11.5px var(--mono); color: var(--ink); }
+.ex-head .chip { font-size: 9.5px; padding: 1px 6px; }
+.thumbs { display: flex; gap: 8px; margin: 8px 0 4px; }
+button.thumb { border: 1px solid var(--line); background: var(--stage); border-radius: 6px; padding: 0; cursor: pointer;
+  display: flex; flex-direction: column; overflow: hidden; width: 104px; }
+button.thumb:hover { border-color: var(--act); }
+button.thumb img { width: 100%; aspect-ratio: 11 / 13; image-rendering: pixelated; display: block; }
+button.thumb span { font: 10px var(--mono); color: #cfd6dd; padding: 2px 4px; text-align: left; }
+.thumb.missing { font: 10px var(--mono); color: var(--ink-3); }
+.ex details > summary { font-size: 11.5px !important; }
+.ex pre.code { max-height: 300px; font-size: 10.5px; }

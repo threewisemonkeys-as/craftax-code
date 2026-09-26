@@ -76,6 +76,7 @@
             <span><i class="eye"></i> looked at <i class="eye crop"></i> crop of it</span>
             <span><i class="load"></i> work before it</span>
             <span id="hand-key" hidden><i class="hand"></i> a new session takes over</span>
+            <span id="learn-key" hidden><i class="learn"></i> the world model was updated</span>
           </div>
           <div class="frame-line" id="frame-name"></div>
           <div class="transport">
@@ -91,7 +92,7 @@
               <button class="tb" id="play">▶ play</button>
               <button class="tb" id="next">step →</button>
               <button class="tb" id="next-batch" title="Next batch (Shift + Right)">batch ⇥</button>
-              <button class="tb" id="next-event" title="Next achievement, descent or death (Shift + Down)">next event ↓</button>
+              <button class="tb" id="next-event" title="Next achievement, descent, death or model update (Shift + Down)">next event ↓</button>
               <span class="counter num" id="counter"></span>
               <span class="keys">
                 <kbd>←</kbd> <kbd>→</kbd> step · <kbd>shift</kbd>+<kbd>←</kbd><kbd>→</kbd> batch ·
@@ -137,6 +138,25 @@
         <header><h2>What it wrote down</h2><span class="hint">notes.md, at the end</span></header>
         <div class="body" id="notes"></div>
       </div>
+    </div>
+  </div>
+
+  <div class="card learning" id="learning" hidden>
+    <header>
+      <h2>Learning</h2>
+      <span class="hint" id="learn-hint"></span>
+      <button class="tb small" id="learn-follow" title="show the update at the cursor">follow the cursor</button>
+    </header>
+    <div class="body">
+      <div class="learn-top">
+        <div>
+          <div class="learn-picks" id="learn-picks"></div>
+          <div class="learn-chart" id="learn-chart"></div>
+          <p class="note" id="learn-note"></p>
+        </div>
+        <div id="learn-facts"></div>
+      </div>
+      <div id="learn-detail"></div>
     </div>
   </div>
 
@@ -692,6 +712,7 @@ function index() {
   /* A handover names the action the run stopped at, and the session that takes over
      plays the next one. So the boundary sits before the first frame past that
      action, which is also how `sessionAt` reads it. */
+  game._byName = new Map(game.frames.map((f, i) => [f.name, i]));
   game._hand = (game.handovers || []).map((h) => ({
     ...h, at: game.frames.findIndex((f) => f.n > h.n),
   })).filter((h) => h.at >= 0);
@@ -757,6 +778,15 @@ function buildTrack() {
     m.title = `action ${h.n} — session ${h.session} takes over\n${h.note || ""}`.trim();
     track.appendChild(m);
   }
+  for (const u of game.learning || []) {
+    if (u.at == null) continue;
+    const m = document.createElement("div");
+    m.className = "mark learn" + (u.running ? " running" : !u.shipped ? " failed" : "");
+    m.style.left = pct(frameAfter(u) + 1) + "%";
+    m.title = `after action ${u.at} — update ${u.k}: ` + (u.running ? "still running"
+      : u.shipped ? "shipped a new model" : "kept the old model");
+    track.appendChild(m);
+  }
   el("slider").max = String(n - 1);
   drawCurve();
 }
@@ -812,7 +842,9 @@ function renderNow(f) {
     (DATA.replayed ? fact("life", f.life) : "") +
     (DATA.replayed ? fact("level", f.level) : "") +
     ((game._hand || []).length
-      ? fact("session", `${sessionAt(idx)}/${game._hand.length + 1}`) : "");
+      ? fact("session", `${sessionAt(idx)}/${game._hand.length + 1}`) : "") +
+    ((game.learning || []).length
+      ? fact("model", (m => m ? `update ${m.k}, from ${m.at + 1}` : "none yet")(modelAt(idx))) : "");
   el("meters").innerHTML = !DATA.replayed ? "" :
     [["health", f.hp, 9], ["food", f.food, 9], ["drink", f.drink, 9],
      ["energy", f.energy, 9]]
@@ -940,6 +972,307 @@ function renderMoment(m) {
   </div>`;
 }
 
+/* ── learning ───────────────────────────────────────────────────────────────
+   A world-model arm stops at its pauses and hands the run so far to a learner,
+   which searches for a better model — a perception module and a document of world
+   knowledge — and ships the best one it can vouch for into the agent's workspace.
+   This card is that search, one update at a time: what the learner was given, how
+   the model the agent had fared on play it had not seen, every candidate it tried
+   and where it came from, what each step was shown and what it wrote back, and
+   what shipped. A run without a pause hook has no updates and no card.
+
+   The card follows the cursor — it shows the latest update at or before the action
+   under it — until an update is picked, which pins it: an example's frames are
+   earlier in the run, and jumping to one should not swap the card from under it. */
+let learnPin = null;     /* k of the update the viewer picked, or null to follow */
+let learnShown = null;   /* the update on the card, so scrubbing redraws only on a change */
+
+const num = (v, d = 3) => (v == null || Number.isNaN(+v) ? "—" : (+v).toFixed(d));
+const money = (v) => (v == null ? "—" : "$" + (+v).toFixed(2));
+const minutes = (s) => (s == null ? "—" : s >= 3600 ? (s / 3600).toFixed(1) + " h"
+  : Math.round(s / 60) + " min");
+const signed = (v) => (v > 0 ? "+" : "") + v.toFixed(3);
+
+/* The last update at or before a frame; the first one before any. */
+function updateAt(i) {
+  const n = game.frames[i].n;
+  let got = null;
+  for (const u of game.learning || []) if (u.at != null && u.at <= n) got = u;
+  return got;
+}
+
+/* The model the agent was using when it played a frame: the last one shipped by an
+   update that ran before the action. Update k runs after action `at`, so the action
+   at `at` itself was still played with the model before it. */
+function modelAt(i) {
+  const n = game.frames[i].n;
+  let got = null;
+  for (const u of game.learning || []) if (u.shipped && u.at != null && u.at < n) got = u;
+  return got;
+}
+
+/* The frame just after an update: where its mark sits on the track, and where
+   picking it puts the cursor. */
+function frameAfter(u) {
+  let at = -1;
+  game.frames.forEach((f, i) => { if (f.n <= u.at) at = i; });
+  return Math.max(0, Math.min(game.frames.length - 1, at));
+}
+
+function learnChart(all, sel) {
+  /* One column per update. The learner's own objective (its best score on the rows
+     it trained on) and the two held-out scores of the model the agent had, measured
+     on the segment it had just played before any of it was trained on. */
+  const W = 560, H = 150, L = 34, R = 10, T = 12, B = 26;
+  const x = (j) => L + (all.length < 2 ? (W - L - R) / 2 : (j * (W - L - R)) / (all.length - 1));
+  const y = (v) => T + (1 - v) * (H - T - B);
+  const series = [
+    ["train", "var(--ink-3)", (u) => u.best, "best score on its training rows"],
+    ["id", "var(--act)", (u) => u.prequential && u.prequential.id, "held-out ID of the model in use"],
+    ["cfd", "var(--off)", (u) => u.prequential && u.prequential.cfd, "held-out cFD of the model in use"],
+  ];
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Scores at each update">`;
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+      `<text class="ax" x="${L - 6}" y="${y(v) + 3}" text-anchor="end">${v}</text>`;
+  }
+  const chance = all.find((u) => u.prequential && u.prequential.cfd_chance);
+  if (chance) {
+    const c = chance.prequential.cfd_chance;
+    svg += `<line class="chance" x1="${L}" x2="${W - R}" y1="${y(c)}" y2="${y(c)}"/>` +
+      `<text class="ax" x="${W - R}" y="${y(c) - 4}" text-anchor="end">cFD chance</text>`;
+  }
+  all.forEach((u, j) => {
+    svg += `<g class="col${u === sel ? " on" : ""}" data-k="${u.k}">` +
+      `<rect x="${x(j) - 14}" y="${T - 6}" width="28" height="${H - T - B + 12}" rx="4"/>` +
+      `<text class="ax" x="${x(j)}" y="${H - 8}" text-anchor="middle">@${esc(u.at)}</text></g>`;
+  });
+  for (const [, colour, get, what] of series) {
+    const pts = all.map((u, j) => [j, get(u)]).filter(([, v]) => v != null);
+    if (pts.length > 1) {
+      svg += `<polyline fill="none" stroke="${colour}" stroke-width="1.6" points="${
+        pts.map(([j, v]) => `${x(j)},${y(v)}`).join(" ")}"/>`;
+    }
+    for (const [j, v] of pts) {
+      svg += `<circle cx="${x(j)}" cy="${y(v)}" r="3.4" fill="${colour}">` +
+        `<title>update ${all[j].k} · ${what}: ${num(v)}</title></circle>`;
+    }
+  }
+  svg += `</svg>`;
+  const key = series.map(([, colour, , what]) =>
+    `<span><i style="background:${colour}"></i>${esc(what)}</span>`).join("");
+  return svg + `<div class="chart-legend">${key}</div>`;
+}
+
+function learnPicks(all, sel) {
+  return all.map((u) => {
+    const state = u.running ? "running" : u.exit ? "failed" : u.shipped ? "shipped" : "kept the old model";
+    return `<button class="tb small pick${u === sel ? " on" : ""}" data-k="${u.k}"
+      title="update ${u.k} after action ${esc(u.at)} — ${state}">#${u.k} · @${esc(u.at)}
+      <span class="dot ${u.running ? "zero" : u.exit ? "critical" : u.shipped ? "good" : "warning"}"></span></button>`;
+  }).join("");
+}
+
+function learnFacts(u) {
+  const c = u.composition || {}, costs = u.costs || {}, s = u.search || {};
+  const state = u.running ? "still running" : u.exit ? `failed (exit ${u.exit})`
+    : u.shipped ? `shipped #${(u.ship || {}).idx ?? "?"}` : "kept the old model";
+  return `<dl class="facts">` +
+    fact("update", `${u.k} of ${game.learning.length}`) +
+    fact("after action", u.at) +
+    fact("paused on", (u.events || []).join(", ") || "—") +
+    fact("outcome", state) +
+    fact("took", minutes(u.seconds)) +
+    fact("cost", money(u.cost)) +
+    fact("run so far", u.buffer ? `${u.buffer.transitions} steps · ${plural(u.buffer.lives, "life")}` : "—") +
+    fact("trained on", c.new != null ? `${c.new} new + ${c.replay} replayed` : (s.rows ? `${s.rows} rows` : "—")) +
+    fact("scorer F", s.task_lm || "—") +
+    fact("reflector", s.reflection_lm || "—") +
+    (Object.keys(costs).length ? fact("spent on", Object.entries(costs)
+      .map(([k, v]) => `${({ rexpure_f: "scoring", rexpure_reflection: "reflection",
+        prequential: "held-out" })[k] || k} ${money(v)}`).join(" · ")) : "") +
+    `</dl>`;
+}
+
+function diffHtml(text) {
+  return text.split("\n").map((line) => {
+    const cls = line.startsWith("@@") ? "hunk" : line[0] === "+" ? "add" : line[0] === "-" ? "del" : "";
+    return cls ? `<span class="${cls}">${esc(line)}</span>` : esc(line);
+  }).join("\n");
+}
+
+/* The candidates as the tree the search grew: each under the one it was edited
+   from, with its score on the training rows and what that edit gained or lost. */
+function learnTree(u) {
+  const nodes = (u.search || {}).nodes || [];
+  if (!nodes.length) return "";
+  const kids = new Map();
+  for (const nd of nodes) {
+    const p = nd.parent == null ? -1 : nd.parent;
+    if (!kids.has(p)) kids.set(p, []);
+    kids.get(p).push(nd);
+  }
+  const byIdx = new Map(nodes.map((nd) => [nd.idx, nd]));
+  const top = Math.max(0.001, ...nodes.map((nd) => nd.score || 0));
+  const shippedIdx = (u.ship || {}).idx;
+  const screened = new Map((u.screened || []).map((s) => [s.idx, s]));
+  const rows = [];
+  const walk = (nd, depth) => {
+    const parent = byIdx.get(nd.parent);
+    const delta = parent && parent.score != null && nd.score != null ? nd.score - parent.score : null;
+    const gate = screened.get(nd.idx);
+    rows.push(`<div class="node${nd.idx === shippedIdx ? " shipped" : ""}" style="--depth:${depth}">
+      <span class="id">#${nd.idx}</span>
+      <span class="what">${nd.parent == null ? "the model the agent had"
+        : "edited " + esc((nd.edited || []).join(", ").replace("_", " ") || "?") + " of #" + nd.parent}</span>
+      <span class="bar"><i style="width:${(100 * (nd.score || 0)) / top}%"></i></span>
+      <span class="num">${num(nd.score)}</span>
+      <span class="num delta ${delta == null ? "" : delta > 0 ? "up" : delta < 0 ? "down" : ""}">${
+        delta == null ? "" : signed(delta)}</span>
+      <span class="tags">${nd.idx === shippedIdx ? `<b class="chip good">shipped</b>` : ""}${
+        gate && !gate.ok ? `<b class="chip critical" title="${esc(gate.why || gate.error || "")}">failed the gate</b>` : ""}</span>
+    </div>`);
+    for (const k of kids.get(nd.idx) || []) walk(k, depth + 1);
+  };
+  for (const root of kids.get(-1) || []) walk(root, 0);
+  return `<h3>The search <span class="sub">${plural(nodes.length, "candidate")} · score on its
+    ${esc((u.search || {}).rows || "")} training rows (ID set loss and contrastive forward, the lower of the two)</span></h3>
+    <div class="tree">${rows.join("")}</div>`;
+}
+
+function exampleHtml(ex) {
+  const get = (re) => (ex.fields.find(([k]) => re.test(k)) || [])[1];
+  const truth = get(/^TRUE action/), pred = get(/^predicted action/);
+  const pics = ex.frames.map(([role, name]) => {
+    const i = game._byName.get(name);
+    if (i == null) return `<span class="thumb missing">${esc(name)}</span>`;
+    return `<button class="thumb" data-frame="${i}" title="${esc(role)} — go to action ${game.frames[i].n}">
+      <img loading="lazy" src="${src(nearest(i))}" alt="${esc(role)}"><span>${esc(role.replace("raw_state_1", "X_t").replace("raw_state_2", "X_t+1"))} · ${game.frames[i].n}</span></button>`;
+  }).join("");
+  const rest = ex.fields.filter(([k]) => !/^(TRUE action|predicted action)/.test(k));
+  const correct = rest.some(([k, v]) => k === "Forward Prediction" && /correct case/.test(v));
+  /* Wrong on which test: a set that holds the true action passed ID, so the example
+     is here for the forward check it failed. */
+  const bare = (t) => String(t || "").replace(/['"\s]/g, "");
+  const idOk = truth && pred && bare(pred).replace(/^\[|\]$/g, "").split(",").includes(bare(truth));
+  const forwardBad = rest.some(([k, v]) => /FAILED|CONTRASTIVE/.test(v));
+  const miss = idOk ? "forward check failed" : forwardBad ? "action and forward check missed" : "action missed";
+  return `<div class="ex${correct ? " right" : ""}">
+    <div class="ex-head">${correct ? `<b class="chip good">correct, shown for contrast</b>`
+      : `<b class="chip critical">${miss}</b>`}
+      ${truth ? `<span>true <code>${esc(truth)}</code></span>` : ""}
+      ${pred ? `<span>predicted <code>${esc(pred)}</code></span>` : ""}</div>
+    ${pics ? `<div class="thumbs">${pics}</div>` : ""}
+    ${rest.map(([k, v]) => `<details><summary>${esc(k)}</summary><pre class="code">${esc(v)}</pre></details>`).join("")}
+  </div>`;
+}
+
+function stepHtml(u, st) {
+  const delta = st.score != null && st.parent_score != null ? st.score - st.parent_score : null;
+  const changes = Object.entries(st.changes || {});
+  return `<div class="evt lstep">
+    <div class="top">
+      <span class="tag">step ${esc(st.i)}</span>
+      <span class="name">#${esc(st.parent)} (${num(st.parent_score)}) → #${esc(st.child)} (${num(st.score)}) ·
+        rewrote the ${esc(st.edited.join(", ").replace("_", " "))}</span>
+      ${delta == null ? "" : `<b class="chip ${delta > 0 ? "good" : delta < 0 ? "critical" : ""}">${signed(delta)}</b>`}
+    </div>
+    <details><summary>what the reflector was shown — ${plural(st.told.length, "example")}${
+      st.prompt_chars ? ` · a ${Math.round(st.prompt_chars / 1000)}k-character prompt` : ""}</summary>
+      <div class="exs">${st.told.map(exampleHtml).join("")}</div></details>
+    <details${st.account ? "" : " hidden"}><summary>what it wrote back</summary>
+      <pre class="code prose">${esc(st.account)}</pre></details>
+    ${changes.map(([comp, d]) => `<details><summary>the change to the ${esc(comp.replace("_", " "))} —
+      +${d.added} −${d.dropped} lines</summary><pre class="code diff">${diffHtml(d.text)}</pre></details>`).join("")}
+  </div>`;
+}
+
+function learnDetail(u) {
+  const s = u.search;
+  const pre = u.prequential;
+  let html = "";
+  if (u.error) html += `<p class="learn-err">${esc(u.error)}</p>`;
+  html += `<h3>The model the agent had, on play it had not been trained on</h3>` + (
+    pre && pre.n ? `<div class="pre">
+      <div><b class="big">${num(pre.id, 2)}</b><span>inverse dynamics (ID): which action
+        was taken, from the model's own text of the frames either side</span></div>
+      <div><b class="big">${num(pre.cfd, 2)}</b><span>contrastive forward (cFD): the true next
+        frame among ${Math.round(1 / (pre.cfd_chance || 0.25)) - 1} decoys — chance ${num(pre.cfd_chance, 2)}</span></div>
+      <div><b class="big">${esc(pre.n)}</b><span>new steps scored, before any of them was trained on
+        ${pre.cost_usd != null ? `· ${money(pre.cost_usd)}` : ""}</span></div></div>`
+    : `<p class="empty">${u.k === 1 ? "No model yet: this is the first update." : "Not scored."}</p>`);
+  if (!s) {
+    html += `<p class="empty">${u.running ? "The learner has written nothing it can show yet."
+      : "The learner left no record of its search beside the run."}</p>`;
+  } else {
+    html += learnTree(u);
+    if (s.steps.length) {
+      html += `<h3>Step by step <span class="sub">each step picks a candidate, shows a reflection
+        model where it goes wrong, and scores the rewrite it proposes</span></h3>` +
+        s.steps.map((st) => stepHtml(u, st)).join("");
+    } else if (!s.done) {
+      html += `<p class="empty">${u.running ? "Still searching — each step's detail is written when the search ends."
+        : "The search ended without a record of its steps."}</p>`;
+    }
+  }
+  const m = u.model || {};
+  if (Object.keys(m).length) {
+    html += `<h3>What shipped <span class="sub">candidate #${esc((u.ship || {}).idx)}, before
+      ${plural((u.ship || {}).redactions || 0, "redaction")} of the game's name</span></h3>`;
+    for (const [comp, what] of Object.entries(m)) {
+      html += `<details><summary>the ${esc(comp.replace("_", " "))} — ${what.chars.toLocaleString()}
+        characters, +${what.diff.added} −${what.diff.dropped} lines against the one it replaced</summary>
+        <details class="inner"><summary>the change</summary><pre class="code diff">${diffHtml(what.diff.text)}</pre></details>
+        <details class="inner"${comp === "world_knowledge" ? " open" : ""}><summary>as shipped</summary>
+        <pre class="code">${esc(what.text)}</pre></details></details>`;
+    }
+  }
+  const log = (s && s.log) || u.hook_log;
+  if (log) html += `<details class="log"><summary>the learner's log</summary><pre class="code">${esc(log)}</pre></details>`;
+  return html;
+}
+
+function renderLearning(force) {
+  const all = game.learning || [];
+  el("learning").hidden = !all.length;
+  if (!all.length) return;
+  const u = (learnPin != null && all.find((x) => x.k === learnPin)) || updateAt(idx) || all[0];
+  if (!force && u === learnShown) return;
+  learnShown = u;
+  const spent = all.reduce((a, x) => a + (x.cost || 0), 0);
+  const took = all.reduce((a, x) => a + (x.seconds || 0), 0);
+  const ok = all.filter((x) => x.shipped).length;
+  el("learn-hint").textContent = `${plural(all.length, "update")} · ${ok} shipped · ` +
+    `${money(spent)} · ${minutes(took)}`;
+  el("learn-follow").hidden = learnPin == null;
+  el("learn-picks").innerHTML = learnPicks(all, u);
+  el("learn-chart").innerHTML = learnChart(all, u);
+  el("learn-note").innerHTML = `Held-out scores are the model the agent was using, on the
+    steps it had just played; update 1 has none, since there was no model before it.`;
+  el("learn-facts").innerHTML = learnFacts(u);
+  el("learn-detail").innerHTML = learnDetail(u);
+}
+
+function pickUpdate(k, jump) {
+  learnPin = k;
+  const u = game.learning.find((x) => x.k === k);
+  if (jump && u) show(frameAfter(u));
+  renderLearning(true);
+}
+
+el("learning").addEventListener("click", (e) => {
+  const pick = e.target.closest("[data-k]");
+  if (pick) { stop(); pickUpdate(+pick.dataset.k, true); return; }
+  const thumb = e.target.closest("button.thumb");
+  if (thumb) {
+    stop();
+    if (learnPin == null && learnShown) learnPin = learnShown.k;
+    show(+thumb.dataset.frame);
+    el("learn-follow").hidden = false;
+  }
+});
+el("learn-follow").addEventListener("click", () => { learnPin = null; renderLearning(true); });
+
 /* ── driving ────────────────────────────────────────────────────────────── */
 function show(i) {
   idx = Math.max(0, Math.min(game.frames.length - 1, i));
@@ -957,6 +1290,7 @@ function show(i) {
   renderIntent(f);
   renderAch(f);
   renderWork(f);
+  renderLearning(false);
   drawChart();
 }
 
@@ -970,7 +1304,8 @@ function jumpBatch(dir) {
 /* An achievement, a change of level or a life ending — the moments worth walking
    between on a run three thousand actions long. */
 function jumpEvent(dir) {
-  const interesting = (f) => f.fired || f.dlevel || f.events.length;
+  const updated = new Set((game.learning || []).map((u) => u.at));
+  const interesting = (f) => f.fired || f.dlevel || f.events.length || updated.has(f.n);
   for (let i = idx + dir; i >= 0 && i < game.frames.length; i += dir) {
     if (interesting(game.frames[i])) return show(i);
   }
@@ -1012,6 +1347,9 @@ function load(label) {
     : `<p class="empty">This session left no notes.md.</p>`;
   index();
   el("hand-key").hidden = !(game.handovers || []).length;
+  el("learn-key").hidden = !(game.learning || []).length;
+  learnPin = null;
+  learnShown = null;
   buildTrack();
   buildLegend();
   buildBaselines();

@@ -73,6 +73,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "rig"))
 
 import run  # noqa: E402
+from learning import learning  # noqa: E402
 
 BODY = ROOT / "tools" / "replay_body.html"
 CSS = ROOT / "tools" / "replay.css"
@@ -737,6 +738,7 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
         curve = thin(best_curve([r["reward"] for r in rows],
                                 [not r["alive"] for r in rows])) if rows else []
         art = pictures(ws, frames, out, label, inline)
+        learned = learning(root, run.RIG, label, record)
         runs.append({
             "label": label, "variant": meta["variant"], "seed": meta.get("seed", 0),
             # Which CLI, and which launch it was played out of. Both are on the run
@@ -755,7 +757,9 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
                    f"{'fresh' if record.get('fresh_world') else 'same'} world"
                    # And the reasoning effort, where the launch set one: two runs
                    # differing in nothing else were the same row before it.
-                   + (f" · {effort} effort" if (effort := effort_of(root, label)) else ""),
+                   + (f" · {effort} effort" if (effort := effort_of(root, label)) else "")
+                   # And whether it paused to learn a world model, which is the arm.
+                   + (" · world model" if learned else ""),
             # Whether the sessions ran inside the filesystem fence — no longer a fact
             # about the CLI alone, since a Claude run can be launched with `--fence`.
             "fenced": fenced_of(root, label, agent, report),
@@ -788,6 +792,9 @@ def one_launch(root: Path, out: Path, inline: bool, replay_world: bool,
             "notes": (ws / "notes.md").read_text(errors="replace")[:40000]
             if (ws / "notes.md").exists() else "",
             "files": sorted(p.name for p in ws.glob("*.py")),
+            # What a world-model arm learned at each pause; [] for a run without a
+            # pause hook, and the page then has no Learning section.
+            "learning": learned,
             **art,
         })
     return runs

@@ -85,7 +85,7 @@ def size(path: Path) -> int:
 
 
 def fingerprint(roots: list[Path]) -> dict[str, tuple]:
-    """Every world being watched, by the three things about it that only grow.
+    """Every world being watched, by the things about it that only grow.
 
     Not the frame count, which would mean listing thirty thousand files a cycle to
     learn what the log's own length already says.
@@ -94,10 +94,15 @@ def fingerprint(roots: list[Path]) -> dict[str, tuple]:
     for root in roots:
         for label in worlds(root):
             ws = root / label
+            got = record(root, label)
             out[f"{root.name}/{label}"] = (
                 size(ws / "logs.txt"),
                 size(ws / "agent_stream.jsonl"),
-                int(record(root, label).get("actions_used") or 0),
+                int(got.get("actions_used") or 0),
+                # A world-model arm's learning: a pause begins an update and a line
+                # in the updates log ends one, and neither moves the three above.
+                len(got.get("pauses") or []),
+                size(root / run.RIG / "updates" / f"{label}.jsonl"),
             )
     return out
 

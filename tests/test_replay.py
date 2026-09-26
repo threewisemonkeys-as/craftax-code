@@ -726,3 +726,99 @@ def test_the_arm_record_is_read_before_any_report_exists(tmp_path):
         {"agent": "claude", "model": "claude-fable-5", "fenced": True}))
     one, = page([root], tmp_path / "p.html")["runs"]
     assert one["arm"] == "claude fable-5 · stint 10 · same world" and one["fenced"] is True
+
+
+# --------------------------------------------------------------------------- #
+# The world-model arm's learning
+# --------------------------------------------------------------------------- #
+
+
+def learned(root: Path, label: str, *, running: bool = False) -> Path:
+    """One finished update at action 2 — the harness's record of it and the learner's
+    own working beside it — and, if `running`, a second pause with no line yet."""
+    record_path = root / ".envs" / label / run.RESULT
+    record = json.loads(record_path.read_text())
+    record["pauses"] = [{"at": 2, "events": ["reward"]}] + (
+        [{"at": 3, "events": ["death"]}] if running else [])
+    record_path.write_text(json.dumps(record))
+    here = root / run.RIG / "updates"
+    (here / label).mkdir(parents=True)
+    (here / f"{label}.jsonl").write_text(json.dumps(
+        {"update": 1, "at": 2, "exit": 0, "shipped": True, "cost_usd": 1.5,
+         "seconds": 60.0, "events": ["reward"]}) + "\n")
+    (here / label / "001.json").write_text(json.dumps(
+        {"update": 1, "shipped": True, "ship": {"idx": 1, "redactions": 0},
+         "composition": {"new": 2, "replay": 0}, "best_train_score": 0.75}))
+
+    online = root / ".envs" / label / "online"
+    work = online / "updates" / "001"
+    seed = work / "rexpure_run_seed1"
+    seed.mkdir(parents=True)
+    x = online / "frames" / "abc.png"
+    (online / "frame_index.json").write_text(json.dumps({"frames/000001.png": str(x)}))
+    (work / "rexpure.log").write_text(
+        "task_lm (F) = small | reflection_lm = big\n"
+        "[rexpure] seed full-train score h0=0.5000 | nodes_explored=1\n"
+        "[rexpure] it=1: parent 0 (h=0.500) -> child 1 h=0.750 [perception] | n=2\n")
+    old = "def perceive(prev, observation):\n    return prev\n"
+    new = ("def perceive(prev, observation):\n"
+           "    # remember where the player stood last and what it faced\n"
+           "    return prev + 'x'\n")
+    (seed / "candidates.jsonl").write_text("".join(json.dumps(c) + "\n" for c in (
+        {"idx": 0, "parents": [], "train_score": 0.5, "perception": old, "world_knowledge": "w"},
+        {"idx": 1, "parents": [0], "train_score": 0.75, "perception": new, "world_knowledge": "w"},
+    )))
+    (seed / "process_log.jsonl").write_text(json.dumps({
+        "i": 1, "selected": 0, "selected_score": 0.5, "components": ["perception"],
+        "new_idx": 1, "new_score": 0.75, "verdict": "accepted", "accepted": True,
+        "minibatch_ids": [0, 1], "proposed": {"perception": new},
+        "feedback": {"perception": [{
+            "Inverse Dynamics": {"raw_state_1 (PREFIX ONLY)": str(x),
+                                 "TRUE action": "'left'", "predicted action set": "['up']"},
+            "Feedback": "INVERSE: missed"}]},
+    }) + "\n")
+    (seed / "reflection_calls.jsonl").write_text(json.dumps(
+        {"call": 1, "component": "world_knowledge", "prompt": "p" * 40,
+         "response": f"It forgot the player.\n\n```python\n{new}```\n"}) + "\n")
+    return root
+
+
+def test_a_run_that_never_paused_to_learn_has_no_learning_section(tmp_path):
+    root = launch(tmp_path / "L", "AAAAA", "claude", played=3, budget=10)
+    one, = page([root], tmp_path / "p.html")["runs"]
+    assert one["learning"] == []
+
+
+def test_an_update_is_its_record_and_the_search_the_learner_left(tmp_path):
+    root = learned(launch(tmp_path / "L", "AAAAA", "claude", played=3, budget=10), "AAAAA")
+    one, = page([root], tmp_path / "p.html")["runs"]
+    u, = one["learning"]
+    assert (u["k"], u["at"], u["shipped"], u["cost"]) == (1, 2, True, 1.5)
+    s = u["search"]
+    assert [(n["idx"], n["parent"], n["score"]) for n in s["nodes"]] == [(0, None, 0.5), (1, 0, 0.75)]
+    assert (s["task_lm"], s["reflection_lm"]) == ("small", "big")
+    step, = s["steps"]
+    # the call is matched by what it wrote, not by the component it was logged under
+    assert step["account"].startswith("It forgot the player.")
+    assert "def perceive" not in step["account"], "the new module belongs in the diff"
+    assert step["changes"]["perception"]["added"] == 2
+    told, = step["told"]
+    assert told["frames"] == [["raw_state_1", "frames/000001.png"]]
+    assert ["TRUE action", "'left'"] in told["fields"]
+    assert u["model"]["perception"]["diff"]["added"] == 2
+
+
+def test_an_update_still_running_is_shown_as_running(tmp_path):
+    root = learned(launch(tmp_path / "L", "AAAAA", "claude", played=3, budget=10),
+                   "AAAAA", running=True)
+    one, = page([root], tmp_path / "p.html")["runs"]
+    assert [(u["k"], u["at"], u["running"]) for u in one["learning"]] == \
+        [(1, 2, False), (2, 3, True)]
+    assert one["learning"][1]["search"] is None
+
+
+def test_an_update_ending_is_something_new_to_build(tmp_path):
+    root = launch(tmp_path / "L", "AAAAA", "claude", played=3, budget=10)
+    was = watch_replay.fingerprint([root])
+    learned(root, "AAAAA")
+    assert watch_replay.fingerprint([root]) != was
