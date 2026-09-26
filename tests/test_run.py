@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -1103,6 +1104,45 @@ def test_perceive_runs_the_model_on_the_latest_frame_or_the_ones_named(tmp_path)
     said = subprocess.run(tool + ["frames/000000.png", "frames/000001.png"], cwd=ws,
                           capture_output=True, text=True).stdout
     assert said.strip() == "000000.png|000001.png"
+
+
+def test_a_recursive_model_is_run_over_the_current_life(tmp_path):
+    """perceive(prev, observation) along this life's frames, from "" at its first; the
+    states kept in model/ are reused only by the same model for the same life."""
+    ws = tmp_path / "W"
+    (ws / "frames").mkdir(parents=True)
+    for name in ("000000.png", "000001.png", "000002.png", "000002-restart.png",
+                 "000003.png", "000004.png"):
+        (ws / "frames" / name).write_bytes(b"")
+    (ws / "model").mkdir()
+    (ws / "model" / "VERSION").write_text(json.dumps({"recursive": {"burn_in": None}}))
+    (ws / "model" / "perceive.py").write_text(
+        "import os\n"
+        "def perceive(prev, observation):\n"
+        "    open(os.environ['CALLS'], 'a').write('x')\n"
+        "    return (prev + '|' if prev else '') + observation.rsplit('/', 1)[-1]\n")
+    calls = tmp_path / "calls"
+    tool = [str(run.AGENT_PYTHON), str(ROOT / "tools" / "perceive.py")]
+    env = {**os.environ, "CALLS": str(calls)}
+
+    def said(*names):
+        return subprocess.run(tool + list(names), cwd=ws, capture_output=True, text=True,
+                              env=env).stdout.strip()
+
+    assert said() == "000002-restart.png|000003.png|000004.png", "not this life"
+    assert calls.read_text() == "xxx"
+    (ws / "frames" / "000005.png").write_bytes(b"")
+    assert said().endswith("000004.png|000005.png")
+    assert calls.read_text() == "xxxx", "the kept states were not reused"
+    assert said("frames/000001.png", "frames/000003.png") == "000001.png|000003.png"
+    (ws / "model" / "VERSION").write_text(json.dumps({"recursive": {"burn_in": 1}}))
+    assert said() == "000004.png|000005.png"
+    (ws / "model" / "perceive.py").write_text(
+        "SEEN = []\n"
+        "def perceive(prev, observation):\n"
+        "    SEEN.append(observation)\n"
+        "    return str(len(SEEN))\n")
+    assert said() == "1", "module globals carried memory past `prev`"
 
 
 def test_the_hook_runs_at_every_pause_and_its_cost_is_kept_apart(tmp_path, monkeypatch):
