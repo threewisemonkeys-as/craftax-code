@@ -499,6 +499,14 @@ def session_config(root: Path, label: str, agent=None) -> Path:
     seeds from the operator's file, refreshes when it needs to, and every session
     after inherits the refreshed copy — for as long as the refresh token lives, which
     is about a month rather than about eight hours.
+
+    And a fresher copy goes BACK to the operator's file rather than staying here. A
+    refresh rotates the refresh token, so a copy kept only here leaves the operator's
+    file holding one the server has retired — and everything else living off it (the
+    Claude CLI proxy the pause hook's learner calls) fails "OAuth session expired and
+    could not be refreshed" until someone logs in. That froze a 3k online run for
+    10.7 h on 2026-09-28. With the write-back there is one lineage: the session is
+    re-linked to the operator's file, which now holds the newest token.
     """
     agent = agent or AGENTS["claude"]
     config = root / ".sessions" / label / agent.CONFIG_DIR
@@ -509,11 +517,30 @@ def session_config(root: Path, label: str, agent=None) -> Path:
         return config
     if link.is_symlink() and link.resolve() == credential.resolve():
         return config
-    if agent.freshness(link) > agent.freshness(credential):
-        return config
+    if not link.is_symlink() and agent.freshness(link) > agent.freshness(credential):
+        return_credential(link, credential)
     link.unlink(missing_ok=True)
     link.symlink_to(credential)
     return config
+
+
+def return_credential(copy: Path, credential: Path) -> None:
+    """Replace the operator's credential with a session's fresher copy, atomically.
+
+    Under the same lock the Claude CLI proxy takes to write back its own refreshes
+    (``.credentials.proxy.lock`` beside the file), so the two never interleave.
+    """
+    import fcntl
+    staged = credential.with_name(f".{credential.name}.{secrets.token_hex(8)}.tmp")
+    with open(credential.parent / ".credentials.proxy.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            shutil.copyfile(copy, staged)
+            staged.chmod(0o600)
+            os.replace(staged, credential)
+        finally:
+            staged.unlink(missing_ok=True)
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def site_packages(venv: Path) -> Path:
@@ -1043,6 +1070,9 @@ async def play(
                     argv = fenced_argv(agent, argv, ws, home)
                 stderr, report.exit_code = await one_session(
                     argv, ws, session_env, report, agent)
+                # Straight away rather than at the next session's start: the pause hook
+                # runs in between, and its learner lives off the operator's credential.
+                session_config(root, label, agent)
                 # Before anything reads the stream, and inside the loop rather than
                 # after it: a chain's sessions share one record, and each has to be
                 # taken while it is the newest thing in it.

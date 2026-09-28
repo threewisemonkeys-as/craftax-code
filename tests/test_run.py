@@ -527,8 +527,14 @@ def test_a_refreshed_credential_is_not_thrown_away(tmp_path, monkeypatch):
     credential(theirs, hours=-0.5)
 
     run.session_config(tmp_path / "launch", "B4XPT")
-    assert not link.is_symlink(), "the refreshed token was replaced by an expired one"
-    assert run.credential_life(link)[0] > time.time()
+    assert run.credential_life(link)[0] > time.time(), \
+        "the refreshed token was replaced by an expired one"
+    # ...and it went back to the operator's file rather than staying here: a refresh
+    # rotates the refresh token, so a copy kept only here strands everything else that
+    # lives off the operator's file (the pause hook's proxy) on a retired one.
+    assert link.is_symlink() and link.resolve() == theirs.resolve()
+    assert run.credential_life(theirs)[0] > time.time()
+    assert (theirs.stat().st_mode & 0o777) == 0o600
 
 
 def test_a_stale_local_credential_is_replaced(tmp_path, monkeypatch):
@@ -742,11 +748,14 @@ def test_a_session_gets_the_config_directory_its_own_cli_reads(tmp_path, monkeyp
     link = config / "auth.json"
     assert link.is_symlink() and link.resolve() == theirs.resolve()
     # And the same keep-the-fresher rule, on a stamp that is an age rather than an
-    # expiry: a session that refreshed its own copy does not get it taken away.
+    # expiry: a session that refreshed its own copy does not get it taken away --
+    # it goes back to the operator's file, and the session is linked to that.
     link.unlink()
     link.write_text(json.dumps({"last_refresh": "2026-09-22T19:43:44.000000Z"}))
     run.session_config(tmp_path / "launch", "B4XPT", codex)
-    assert not link.is_symlink(), "the refreshed token was replaced by an older one"
+    assert link.is_symlink() and link.resolve() == theirs.resolve()
+    assert "2026-09-22T19:43:44" in theirs.read_text(), \
+        "the refreshed token was replaced by an older one"
 
 
 def history(home: Path, rows: list[tuple[int, dict]]) -> Path:
